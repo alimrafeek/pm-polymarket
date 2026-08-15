@@ -111,13 +111,88 @@ sol! {
     }
 }
 
-/// Wire values for the CLOB's `orderType` field (the API also takes GTC/GTD/FOK). Only FAK is
-/// used here: every order we send is a marketable take, and FAK guarantees it can never rest on
-/// the book — whatever doesn't fill immediately is canceled by the venue.
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "UPPERCASE")]
-enum OrderType {
-    FAK,
+/// The matching engine treats a GTD order as expired one minute *before* the expiration on the
+/// wire, so the timestamp sent carries this buffer on top of the lifetime the caller asked for.
+const GTD_SECURITY_BUFFER_SECS: u64 = 60;
+/// The CLOB refuses a GTD expiration less than three minutes out; with the buffer above, that
+/// makes two minutes the shortest book lifetime a GTD order can actually be given.
+const GTD_MIN_LIFETIME_SECS: u64 = 120;
+
+/// Which of the CLOB's four `orderType` behaviours an order is sent with, carrying the extra
+/// inputs each one needs. Chosen per order by the caller — the venue module has no default.
+///
+/// The two immediate types never rest: whatever doesn't cross straight away is killed by the
+/// venue, and an order that crosses *nothing at all* is rejected outright (HTTP 400 "no orders
+/// found to match…") rather than acked empty. The two resting types do the opposite — they ack
+/// success with `status: "live"` and zero fill amounts when nothing crosses, so their caller must
+/// read the ack's amounts rather than assume the size it sent traded, and must cancel what rests
+/// (`cancel_poly_order`) if it no longer wants it.
+///
+/// `post_only` is a field of the resting variants only, because it is meaningless on the others:
+/// it tells the venue to reject the order outright rather than let any part of it take, which is
+/// the exact opposite of what FAK/FOK ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolyOrderType {
+    /// Fill-and-kill: takes whatever is available at the limit price or better and the venue
+    /// cancels the remainder. A partial fill still acks success.
+    Fak,
+    /// Fill-or-kill: the whole size fills immediately or none of it does — no partial fills.
+    Fok,
+    /// Good-til-cancelled: fills whatever crosses and rests the remainder on the book until it is
+    /// cancelled or the market resolves.
+    Gtc { post_only: bool },
+    /// Good-til-date: a [`PolyOrderType::Gtc`] the venue cancels once it has been on the book for
+    /// `lifetime_secs`. The wire `expiration` is `now + 60 + lifetime_secs` — see
+    /// [`GTD_SECURITY_BUFFER_SECS`] — and lifetimes under [`GTD_MIN_LIFETIME_SECS`] are refused
+    /// here rather than sent to be refused by the venue.
+    Gtd { lifetime_secs: u64, post_only: bool },
+}
+
+impl PolyOrderType {
+    /// The string the CLOB's `orderType` field takes.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Fak => "FAK",
+            Self::Fok => "FOK",
+            Self::Gtc { .. } => "GTC",
+            Self::Gtd { .. } => "GTD",
+        }
+    }
+
+    /// Maker-only: the venue rejects the order instead of letting any part of it take.
+    pub fn post_only(self) -> bool {
+        match self {
+            Self::Fak | Self::Fok => false,
+            Self::Gtc { post_only } | Self::Gtd { post_only, .. } => post_only,
+        }
+    }
+
+    /// Whether an unfilled remainder stays on the book — i.e. whether the caller is responsible
+    /// for cancelling it.
+    pub fn rests(self) -> bool {
+        matches!(self, Self::Gtc { .. } | Self::Gtd { .. })
+    }
+
+    /// The `expiration` the order body carries: zero for everything but GTD, whose wire value is
+    /// the requested lifetime plus the venue's one-minute security threshold.
+    fn expiration(self, now_secs: i64) -> Result<U256> {
+        let Self::Gtd { lifetime_secs, .. } = self else {
+            return Ok(U256::ZERO);
+        };
+        if lifetime_secs < GTD_MIN_LIFETIME_SECS {
+            return Err(anyhow!(
+                "GTD lifetime {lifetime_secs}s is below the CLOB's minimum of \
+                 {GTD_MIN_LIFETIME_SECS}s (its expiration must be at least \
+                 {}s out, of which {GTD_SECURITY_BUFFER_SECS}s is the security threshold)",
+                GTD_MIN_LIFETIME_SECS + GTD_SECURITY_BUFFER_SECS
+            ));
+        }
+        let now = u64::try_from(now_secs).map_err(|_| anyhow!("system clock is before the epoch"))?;
+        Ok(U256::from(
+            now.saturating_add(GTD_SECURITY_BUFFER_SECS)
+                .saturating_add(lifetime_secs),
+        ))
+    }
 }
 
 /// Subset of the CLOB's POST /order response used for logging and success checks.
@@ -135,9 +210,10 @@ pub struct PolyOrderAck {
     /// 6-decimal fixed-math integers, but live responses return plain decimals; see
     /// sample_response_poly.jsonc), parsed to f64 here for position math. `None` when absent or
     /// unparseable rather than an ack error — a mis-shaped amount on an otherwise accepted order
-    /// must not surface as a rejection, or the fill it reports would go untracked. With FAK
+    /// must not surface as a rejection, or the fill it reports would go untracked. With FAK/FOK
     /// orders the killed remainder never fills later, so comparing the share-side amount against
-    /// what was sent is the partial-fill check.
+    /// what was sent is the partial-fill check; with the resting types (GTC/GTD) these amounts are
+    /// only what crossed *on entry* and the rest may still fill afterwards.
     #[serde(default, rename = "makingAmount")]
     #[serde_as(as = "DefaultOnError<Option<DisplayFromStr>>")]
     pub making_amount: Option<f64>,
@@ -218,15 +294,18 @@ impl PolyTrader {
         self.funder
     }
 
-    /// Place a FAK (fill-and-kill) order for `size` shares at limit `price`: fills whatever is
-    /// available at `price` or better immediately, and the venue cancels any remainder — it never
-    /// rests on the book, so a missed take can't leave a stray order behind. A FAK that crosses
-    /// nothing is rejected outright (HTTP 400 "no orders found to match…"), making that an Err
-    /// like any other rejection; a partial fill still acks success, with the traded quantities in
-    /// the ack's making/taking amounts. `price` is snapped to the market's tick grid and `size`
-    /// truncated to the 2-decimal lot size before signing. Ok only when the CLOB acks with
-    /// success — anything else (HTTP error, success=false, off-grid price, zero match) is an Err
-    /// carrying the venue's response text.
+    /// Place an order for `size` shares at limit `price`, with `order_type` deciding what the
+    /// venue does with whatever doesn't cross immediately — see [`PolyOrderType`], which the
+    /// caller picks per order. `price` is snapped to the market's tick grid and `size` truncated
+    /// to the 2-decimal lot size before signing. Ok only when the CLOB acks with success —
+    /// anything else (HTTP error, success=false, off-grid price, an immediate order that crossed
+    /// nothing, a post-only order that would have taken) is an Err carrying the venue's response
+    /// text.
+    ///
+    /// Ok is *not* proof of a fill: with [`PolyOrderType::Fak`] a partial fill acks success, and
+    /// with the resting types an order that crossed nothing acks success too (`status: "live"`).
+    /// Read the ack's [`PolyOrderAck::filled_shares`] for what actually traded, and remember that
+    /// anything a resting order leaves on the book is this caller's to cancel.
     ///
     /// The send is replayed **only** when it died during TCP/TLS connect, via
     /// [`retry_on_connect`] — see [`Self::post_order_once`] for why that is safe here.
@@ -239,13 +318,24 @@ impl PolyTrader {
         size: Decimal,
         tick_size: Decimal,
         neg_risk: bool,
+        order_type: PolyOrderType,
     ) -> Result<PolyOrderAck> {
-        log_event(market_subtitle, &format!("place_order : {side:?} {size} @ {price} (tick {tick_size})"));
+        log_event(
+            market_subtitle,
+            &format!(
+                "place_order : {side:?} {size} @ {price} (tick {tick_size}, {} post_only={})",
+                order_type.wire(),
+                order_type.post_only()
+            ),
+        );
         let token_id = U256::from_str(token_id)
             .map_err(|e| anyhow!("invalid Polymarket token id: {e:?}"))?;
         let tick_size = tick_size.normalize();
         let price = price.round_dp(tick_size.scale()).normalize();
         let size = size.trunc_with_scale(LOT_SIZE_SCALE).normalize();
+        // Before signing: a lifetime the CLOB would refuse is worth catching here, not after the
+        // signature work.
+        let expiration = order_type.expiration(now_ts())?;
 
         let order = build_limit_order(token_id, price, size, side, tick_size, self.funder)?;
 
@@ -265,17 +355,18 @@ impl PolyTrader {
 
         let payload = SignedOrderPayload {
             order,
-            // Sent on the wire (GTD would use it) but not part of the V2 signature.
-            expiration: U256::ZERO,
+            // Sent on the wire (only GTD uses it) but not part of the V2 signature, which is why
+            // it can be stamped onto an order that was already signed without it.
+            expiration,
             signature_hex,
-            order_type: OrderType::FAK,
+            order_type,
             owner: self.api_key,
-            post_only: false,
+            post_only: order_type.post_only(),
             defer_exec: false,
         };
         let body = serde_json::to_string(&payload)?;
 
-        let what = format!("polymarket order {side:?} {size} @ {price}");
+        let what = format!("polymarket order {} {side:?} {size} @ {price}", order_type.wire());
         let resp = retry_on_connect(market_subtitle, &what, || self.post_order_once(&body)).await?;
 
         let status = resp.status();
@@ -663,7 +754,7 @@ struct SignedOrderPayload {
     order: Order,
     expiration: U256,
     signature_hex: String,
-    order_type: OrderType,
+    order_type: PolyOrderType,
     owner: Uuid,
     post_only: bool,
     defer_exec: bool,
@@ -731,7 +822,7 @@ impl Serialize for SignedOrderPayload {
 
         st.serialize_field("order", &order_with_sig)?;
         st.serialize_field("owner", &self.owner)?;
-        st.serialize_field("orderType", &self.order_type)?;
+        st.serialize_field("orderType", self.order_type.wire())?;
         st.serialize_field("postOnly", &self.post_only)?;
         st.serialize_field("deferExec", &self.defer_exec)?;
         st.end()
@@ -932,7 +1023,7 @@ mod tests {
             order,
             expiration: U256::ZERO,
             signature_hex: "0xabc".to_string(),
-            order_type: OrderType::FAK,
+            order_type: PolyOrderType::Fak,
             owner: Uuid::nil(),
             post_only: false,
             defer_exec: false,
@@ -955,6 +1046,84 @@ mod tests {
         assert!(v["order"].get("taker").is_none());
         assert!(v["order"].get("nonce").is_none());
         assert!(v["order"].get("feeRateBps").is_none());
+    }
+
+    /// The four `orderType` strings are recomputed by nothing — they are what the CLOB matches
+    /// on, so a typo silently changes an order's behaviour rather than failing.
+    #[test]
+    fn order_type_wire_values_and_flags() {
+        assert_eq!(PolyOrderType::Fak.wire(), "FAK");
+        assert_eq!(PolyOrderType::Fok.wire(), "FOK");
+        assert_eq!(PolyOrderType::Gtc { post_only: false }.wire(), "GTC");
+        assert_eq!(
+            PolyOrderType::Gtd { lifetime_secs: 300, post_only: false }.wire(),
+            "GTD"
+        );
+
+        // Only the resting types can rest, and only they can be post-only.
+        assert!(!PolyOrderType::Fak.rests() && !PolyOrderType::Fok.rests());
+        assert!(PolyOrderType::Gtc { post_only: false }.rests());
+        assert!(PolyOrderType::Gtd { lifetime_secs: 300, post_only: true }.rests());
+        assert!(!PolyOrderType::Fak.post_only());
+        assert!(PolyOrderType::Gtc { post_only: true }.post_only());
+        assert!(PolyOrderType::Gtd { lifetime_secs: 300, post_only: true }.post_only());
+    }
+
+    /// GTD is the only type with an expiration, and the venue kills the order a minute before the
+    /// timestamp it is given — so the wire value must carry that minute on top of the lifetime the
+    /// caller asked for, or every GTD order would live 60 s less than requested.
+    #[test]
+    fn gtd_expiration_carries_the_security_buffer() {
+        let now = 1_800_000_000i64;
+        assert_eq!(PolyOrderType::Fak.expiration(now).unwrap(), U256::ZERO);
+        assert_eq!(PolyOrderType::Fok.expiration(now).unwrap(), U256::ZERO);
+        assert_eq!(
+            PolyOrderType::Gtc { post_only: true }.expiration(now).unwrap(),
+            U256::ZERO
+        );
+        assert_eq!(
+            PolyOrderType::Gtd { lifetime_secs: 300, post_only: false }
+                .expiration(now)
+                .unwrap(),
+            U256::from(1_800_000_000u64 + 60 + 300)
+        );
+        // Below the floor the CLOB accepts: refused here rather than sent to be refused there.
+        assert!(PolyOrderType::Gtd { lifetime_secs: 119, post_only: false }
+            .expiration(now)
+            .is_err());
+        assert!(PolyOrderType::Gtd { lifetime_secs: 120, post_only: false }
+            .expiration(now)
+            .is_ok());
+    }
+
+    /// A GTD post-only order's wire body: the type string, a non-zero expiration *inside* the
+    /// order object, and postOnly at the top level beside it.
+    #[test]
+    fn gtd_post_only_payload_shape() {
+        let order = build_limit_order(
+            U256::from(1u8),
+            dec!(0.76),
+            dec!(5),
+            Side::Buy,
+            dec!(0.01),
+            DEPOSIT,
+        )
+        .unwrap();
+        let order_type = PolyOrderType::Gtd { lifetime_secs: 600, post_only: true };
+        let payload = SignedOrderPayload {
+            order,
+            expiration: order_type.expiration(1_800_000_000).unwrap(),
+            signature_hex: "0xabc".to_string(),
+            order_type,
+            owner: Uuid::nil(),
+            post_only: order_type.post_only(),
+            defer_exec: false,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert_eq!(v["orderType"], "GTD");
+        assert_eq!(v["postOnly"], true);
+        assert_eq!(v["order"]["expiration"], (1_800_000_000u64 + 60 + 600).to_string());
     }
 
     /// Ack amounts arrive as plain-decimal strings (a live BUY capture; see
