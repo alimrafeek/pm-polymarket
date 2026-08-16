@@ -8,5 +8,7 @@ pub use rest::{
     get_poly_positions, iso8601_to_epoch,
 };
 pub use trade::{PolyApiCreds, PolyOrderAck, PolyOrderType, PolyTrader};
-pub use types::{PolyTokenBook, PolymarketFeeSchedule, PolymarketMarketDetails};
+pub use types::{
+    PolyTokenBook, PolymarketFeeSchedule, PolymarketMarketDetails, DEFAULT_MIN_ORDER_SIZE,
+};
 pub use ws::run_poly_ws;

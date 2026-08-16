@@ -49,9 +49,21 @@ pub struct PolymarketMarketDetails {
     pub no_bids: Arc<Mutex<Vec<OrderBookLevel>>>,
     pub no_asks: Arc<Mutex<Vec<OrderBookLevel>>>,
     pub tick_size: Arc<Mutex<f64>>,
+    /// Smallest share count the CLOB accepts in one order on this market, from Gamma's
+    /// `orderMinSize`. `5` on every live market sampled 2026-08-16; an order under it is rejected
+    /// with `Size (X) lower than the minimum: 5`. Falls back to [`DEFAULT_MIN_ORDER_SIZE`] when
+    /// Gamma omits the field. Unlike `tick_size` this is not carried on the WS book (no
+    /// `min_order_size_change` message exists), so it stays a plain value.
+    pub min_order_size: f64,
     /// `None` when the market charges no fees (`feesEnabled` false or schedule absent).
     pub fee_schedule: Option<PolymarketFeeSchedule>,
 }
+
+/// Assumed `minimum_order_size` when Gamma doesn't report one. 5 shares — the value every live
+/// market sampled 2026-08-16 carries (the 15 / 14.96 / 0 values still visible in `GET /markets`
+/// all belong to closed or legacy markets). Erring high is the safe direction: an undersized
+/// order is rejected at the venue *after* its hedge on the other venue has already filled.
+pub const DEFAULT_MIN_ORDER_SIZE: f64 = 5.0;
 
 /// A single Polymarket token's order book, keyed by `token_id` in the venue routing map.
 /// The handles are clones of the `Arc`s living inside `PolymarketMarketDetails`, so writes

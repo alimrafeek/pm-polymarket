@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result, anyhow};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::types::{PolymarketFeeSchedule, PolymarketMarketDetails};
+use crate::types::{PolymarketFeeSchedule, PolymarketMarketDetails, DEFAULT_MIN_ORDER_SIZE};
 use venue_core::log::{get_timestamp_ist, log_event};
 
 fn get_value(obj: &Value, key: &str) -> Value {
@@ -480,6 +480,15 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
             .and_then(|v| v.as_f64())
             .ok_or_else(|| anyhow!("orderPriceMinTickSize missing or not a float"))?;
 
+        // Per-market minimum order size in shares. Unlike the tick size this one defaults rather
+        // than failing the event: Gamma has carried `orderMinSize` on every live market sampled,
+        // but a market that omits it is still tradeable at the conventional 5-share floor.
+        let min_order_size = market
+            .get("orderMinSize")
+            .and_then(|v| v.as_f64())
+            .filter(|s| *s > 0.0)
+            .unwrap_or(DEFAULT_MIN_ORDER_SIZE);
+
         // Per-market scheduled resolution time. Defaults to 0 (rather than failing the whole event)
         // if `endDate` is absent/unparseable — it's metadata, not on the trading path.
         let resolution_time = market
@@ -535,6 +544,7 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
             no_bids: Arc::new(Mutex::new(Vec::new())),
             no_asks: Arc::new(Mutex::new(Vec::new())),
             tick_size: Arc::new(Mutex::new(tick_size)),
+            min_order_size,
             fee_schedule,
         });
     }
