@@ -70,6 +70,10 @@ pub const DEFAULT_MIN_ORDER_SIZE: f64 = 5.0;
 /// here are visible to whoever holds the corresponding `TradingState`.
 #[derive(Clone)]
 pub struct PolyTokenBook {
+    /// Human-readable name of this token (`"<title> / <subtitle> YES|NO"`), for diagnostics only —
+    /// the WS watchdog names the tokens that never delivered a snapshot, since a bare token id
+    /// says nothing about which market went quiet.
+    pub label: String,
     pub bids: Arc<Mutex<Vec<OrderBookLevel>>>,
     pub asks: Arc<Mutex<Vec<OrderBookLevel>>>,
     pub tick_size: Arc<Mutex<f64>>,

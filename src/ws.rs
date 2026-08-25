@@ -162,9 +162,11 @@ async fn connect_and_run(
     let result = tokio::select! {
         r = read_loop(&mut read, books, &pending, &last_data_at, conn) => r,
         missing = snapshot_watch(&pending, SNAPSHOT_TIMEOUT) => Err(anyhow!(
-            "watchdog: {missing}/{} asset(s) never sent an initial book snapshot within {:?}",
+            "watchdog: {}/{} asset(s) never sent an initial book snapshot within {:?}: {}",
+            missing.len(),
             asset_ids.len(),
-            SNAPSHOT_TIMEOUT
+            SNAPSHOT_TIMEOUT,
+            describe_assets(&missing, books)
         )),
         () = idle_watch(&last_data_at, IDLE_TIMEOUT) => Err(anyhow!(
             "watchdog: no market data for {:?}",
@@ -176,16 +178,43 @@ async fn connect_and_run(
     result
 }
 
-/// Resolve once the snapshot deadline passes, returning how many assets still have not delivered
+/// Resolve once the snapshot deadline passes, returning the assets that still have not delivered
 /// their initial `book`. If none are missing (subscription healthy) it parks forever, so this
 /// branch of the `select!` never wins.
-async fn snapshot_watch(pending: &Mutex<HashSet<String>>, deadline: Duration) -> usize {
+async fn snapshot_watch(pending: &Mutex<HashSet<String>>, deadline: Duration) -> Vec<String> {
     time::sleep(deadline).await;
-    let missing = pending.lock().await.len();
-    if missing == 0 {
+    let missing: Vec<String> = pending.lock().await.iter().cloned().collect();
+    if missing.is_empty() {
         std::future::pending::<()>().await;
     }
     missing
+}
+
+/// How many silent assets to name in a watchdog message before summarizing the rest. A whole
+/// chunk can go quiet at once (100 tokens), and the full list would bury the log.
+const MAX_NAMED_ASSETS: usize = 12;
+
+/// Render silent asset ids as market names for the log — a bare token id says nothing about which
+/// market stopped snapshotting, which is usually a market that just closed or resolved. Sorted by
+/// name so repeated watchdog trips over the same markets read identically.
+fn describe_assets(asset_ids: &[String], books: &HashMap<String, PolyTokenBook>) -> String {
+    let mut names: Vec<String> = asset_ids
+        .iter()
+        .map(|id| match books.get(id) {
+            Some(book) => book.label.clone(),
+            // Not in the routing map: can't happen (we subscribe to its keys), so show the raw id.
+            None => format!("<unknown token {id}>"),
+        })
+        .collect();
+    names.sort();
+
+    let extra = names.len().saturating_sub(MAX_NAMED_ASSETS);
+    names.truncate(MAX_NAMED_ASSETS);
+    let mut out = names.join("; ");
+    if extra > 0 {
+        out.push_str(&format!("; +{extra} more"));
+    }
+    out
 }
 
 /// Resolve once no data frame has arrived for `timeout`, polling the `last_data_at` clock that
