@@ -44,8 +44,8 @@ use uuid::Uuid;
 
 use venue_core::log::{get_timestamp_ist, log_event};
 use venue_core::trade::{
-    generate_salt, parse_private_key, required_env, retry_on_connect, sign_digest_hex,
-    venue_http_builder, Side, VenueRejected,
+    generate_salt, parse_private_key, probe_round_trips, required_env, retry_on_connect,
+    sign_digest_hex, venue_http_builder, ProbeRun, Side, VenueRejected,
 };
 
 pub(crate) const HOST: &str = "https://clob.polymarket.com";
@@ -428,6 +428,19 @@ impl PolyTrader {
             return Err(anyhow!("Polymarket heartbeat rejected: HTTP {status}: {text}"));
         }
         Ok(())
+    }
+
+    /// Time `samples` round trips to the CLOB, for comparing network routes (a VPN A/B).
+    ///
+    /// Probes [`Self::ping`] — same host, same pooled connection, same L2 signing path `/order`
+    /// uses — so the latency transfers to an order while nothing is placed. Sample 0 is the cold
+    /// connect; see [`probe_round_trips`] for why the two are reported apart.
+    ///
+    /// Worth measuring even though Polymarket is the fast leg today: an arb needs *both* legs to
+    /// land together, so a route that improves Kalshi while degrading this one is a net loss. Only
+    /// probing the slow venue would hide that.
+    pub async fn probe_latency(&self, samples: usize) -> ProbeRun {
+        probe_round_trips(samples, || self.ping()).await
     }
 
     /// Polymarket L2 auth: HMAC-SHA256 over `{timestamp}{method}{path}{body}` with the base64url
