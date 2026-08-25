@@ -56,8 +56,12 @@ pub fn iso8601_to_epoch(s: &str) -> Option<i64> {
 /// `pick_fields` before `parse_market_detail` runs). `feeSchedule` must stay in this list: it is
 /// the only place the per-market taker-fee curve exists — `feesEnabled`/`feeType` alone carry no
 /// rate, and dropping it silently zeroes the Polymarket fee leg in the arbitrage edge math.
-const MARKET_FIELDS: [&str; 12] = [
+const MARKET_FIELDS: [&str; 16] = [
+    "acceptingOrders",
+    "active",
+    "archived",
     "clobTokenIds",
+    "closed",
     "conditionId",
     "endDate",
     "feeSchedule",
@@ -422,8 +426,30 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
     let is_single_market = markets.len() == 1;
 
     let mut result = Vec::new();
+    let mut untradeable = 0usize;
 
     for market in markets {
+        // A live event can still nest dead outcomes — long shots that were closed, de-listed, or
+        // had their book switched off while the event itself runs on. Gamma keeps returning them
+        // and the CLOB still knows their token ids, but the WS never sends a `book` frame for a
+        // token with no order book: the subscription is accepted and then silently ignored. Those
+        // tokens sit in the snapshot watchdog's `pending` set forever and tear down the whole
+        // 100-token shard on every reconnect, so they must never reach the universe.
+        //
+        // Absence is read as permissive: `closed`/`archived` default false, `active`/
+        // `acceptingOrders` default true, matching Gamma's own omit-when-unset behaviour.
+        let flag = |key: &str, default: bool| {
+            market.get(key).and_then(Value::as_bool).unwrap_or(default)
+        };
+        if flag("closed", false)
+            || flag("archived", false)
+            || !flag("active", true)
+            || !flag("acceptingOrders", true)
+        {
+            untradeable += 1;
+            continue;
+        }
+
         let outcome_prices_str = market
             .get("outcomePrices")
             .and_then(|v| v.as_str())
@@ -549,6 +575,15 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
         });
     }
 
+    if untradeable > 0 {
+        println!(
+            "[{}] : [poly] {outer_slug}: skipped {untradeable} untradeable outcome(s) \
+             (closed/archived/inactive/not accepting orders); {} kept",
+            get_timestamp_ist(),
+            result.len()
+        );
+    }
+
     Ok(result)
 }
 
@@ -608,5 +643,53 @@ mod tests {
         let event = json!({ "id": "1", "slug": "no-fees", "markets": [picked] });
         let details = parse_market_detail(event).await.unwrap();
         assert!(details[0].fee_schedule.is_none());
+    }
+
+    /// Regression: a live event nesting dead outcomes must yield only the tradeable ones. Before
+    /// 2026-08-25 the only per-market rejection was the degenerate 0/1 price pair, so closed,
+    /// archived, inactive and order-book-off long shots (priced 0.002/0.998, not degenerate)
+    /// reached the WS universe — where they never snapshot and reconnect-loop the whole shard.
+    #[tokio::test]
+    async fn untradeable_outcomes_are_dropped() {
+        let dead = |title: &str, key: &str, val: bool| {
+            let mut raw = raw_sports_market();
+            raw["groupItemTitle"] = json!(title);
+            raw["outcomePrices"] = json!("[\"0.002\", \"0.998\"]");
+            raw[key] = json!(val);
+            pick_fields(&raw, &MARKET_FIELDS)
+        };
+
+        let mut alive = raw_sports_market();
+        alive["active"] = json!(true);
+        alive["acceptingOrders"] = json!(true);
+        alive["closed"] = json!(false);
+        alive["archived"] = json!(false);
+
+        let event = json!({
+            "id": "27799",
+            "slug": "us-open-winner",
+            "markets": [
+                pick_fields(&alive, &MARKET_FIELDS),
+                dead("Closed", "closed", true),
+                dead("Archived", "archived", true),
+                dead("Inactive", "active", false),
+                dead("NoOrders", "acceptingOrders", false),
+            ],
+        });
+
+        let details = parse_market_detail(event).await.unwrap();
+        assert_eq!(details.len(), 1, "only the tradeable outcome survives");
+        assert_eq!(details[0].market_slug, "Spain");
+    }
+
+    /// Markets that omit the tradeability flags are kept. `pick_fields` inserts every listed key,
+    /// so an omitted flag arrives as JSON `null`, not as a missing key — the permissive defaults
+    /// in the filter are what stop a null from emptying the universe.
+    #[tokio::test]
+    async fn absent_tradeability_flags_are_permissive() {
+        let picked = pick_fields(&raw_sports_market(), &MARKET_FIELDS);
+        assert!(picked["acceptingOrders"].is_null(), "fixture omits the flag");
+        let event = json!({ "id": "1", "slug": "no-flags", "markets": [picked] });
+        assert_eq!(parse_market_detail(event).await.unwrap().len(), 1);
     }
 }
