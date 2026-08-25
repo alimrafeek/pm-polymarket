@@ -323,7 +323,7 @@ impl PolyTrader {
         log_event(
             market_subtitle,
             &format!(
-                "place_order : {side:?} {size} @ {price} (tick {tick_size}, {} post_only={})",
+                "polymarket place_order : {side:?} {size} @ {price} (tick {tick_size}, {} post_only={})",
                 order_type.wire(),
                 order_type.post_only()
             ),
@@ -374,7 +374,10 @@ impl PolyTrader {
         // Raw venue response, printed unconditionally: the parsed ack keeps only a subset of the
         // fields, and rejection bodies otherwise surface only through the returned Err.
         println!("[{}] : [poly] POST /order response: HTTP {status}: {text}", get_timestamp_ist());
-        log_event(market_subtitle, &format!("POST /order response: HTTP {status}: {text}"));
+        log_event(
+            market_subtitle,
+            &format!("polymarket POST /order response: HTTP {status}: {text}"),
+        );
         if !status.is_success() {
             // Typed cause alongside the message: a 4xx here is proof the CLOB matched nothing,
             // which is what lets a flatten retry safely (see `is_definitive_no_fill`).
@@ -384,7 +387,10 @@ impl PolyTrader {
         let ack: PolyOrderAck = serde_json::from_str(&text)
             .with_context(|| format!("unparseable Polymarket ack: {text}"))?;
         if !ack.success {
-            log_event(market_subtitle, &format!("Polymarket order not accepted. PolyOrderAck {:#?}", ack));
+            log_event(
+                market_subtitle,
+                &format!("polymarket order not accepted. PolyOrderAck {:#?}", ack),
+            );
             return Err(anyhow!("Polymarket order not accepted: {text}"));
         }
         Ok(ack)
