@@ -5,7 +5,7 @@ pub mod ws;
 
 pub use rest::{
     cancel_poly_order, get_poly_balance, get_poly_market_data, get_poly_open_orders,
-    get_poly_positions, iso8601_to_epoch,
+    get_poly_order_trades, get_poly_positions, iso8601_to_epoch,
 };
 pub use trade::{PolyApiCreds, PolyOrderAck, PolyOrderType, PolyTrader};
 pub use types::{
