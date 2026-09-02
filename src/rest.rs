@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::types::{PolymarketFeeSchedule, PolymarketMarketDetails, DEFAULT_MIN_ORDER_SIZE};
 use venue_core::log::{get_timestamp_ist, log_event};
+use venue_core::trade::{marked_total, MarkSource, MarkedPosition, PortfolioValue};
 
 fn get_value(obj: &Value, key: &str) -> Value {
     obj.get(key).cloned().unwrap_or(Value::Null)
@@ -225,10 +226,35 @@ const POSITIONS_PAGE_LIMIT: usize = 500;
 /// — and its real holdings are never offered for exit. Positions below `sizeThreshold` (1 share)
 /// are still dropped by the venue, which is dust against a 40-pair cap.
 pub async fn get_poly_positions() -> Result<Vec<(String, f64, f64)>> {
+    fetch_poly_position_rows()
+        .await?
+        .iter()
+        .map(|position| {
+            let asset = position
+                .get("asset")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("position missing asset"))?;
+            let size = position
+                .get("size")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow!("position missing size"))?;
+            let avg_price = position
+                .get("avgPrice")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow!("position missing avgPrice"))?;
+            Ok((asset.to_string(), size, avg_price))
+        })
+        .collect()
+}
+
+/// Every `GET /positions` row for `POLY_FUNDER`, untouched. Shared by [`get_poly_positions`] and
+/// [`get_poly_portfolio`] so the paging loop — and the de-duplication that makes an ignored
+/// `offset` terminate — exists once rather than once per reader.
+async fn fetch_poly_position_rows() -> Result<Vec<Value>> {
     let user = venue_core::trade::required_env("POLY_FUNDER")?;
     let client = reqwest::Client::new();
 
-    let mut result: Vec<(String, f64, f64)> = Vec::new();
+    let mut result: Vec<Value> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut offset: usize = 0;
     loop {
@@ -260,21 +286,13 @@ pub async fn get_poly_positions() -> Result<Vec<(String, f64, f64)>> {
                 .get("asset")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("position missing asset"))?;
-            let size = position
-                .get("size")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow!("position missing size"))?;
-            let avg_price = position
-                .get("avgPrice")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow!("position missing avgPrice"))?;
             // One token can only be held once, so a repeat means the venue served a page we have
             // already read. Keying on the id makes an ignored `offset` a loop that terminates
             // rather than one that spins forever re-reading page one.
             if !seen.insert(asset.to_string()) {
                 continue;
             }
-            result.push((asset.to_string(), size, avg_price));
+            result.push(position.clone());
             added += 1;
         }
 
@@ -355,6 +373,105 @@ async fn get_poly_balance_once(trader: &crate::trade::PolyTrader) -> Result<f64>
         _ => return Err(anyhow!("balance missing in response: {text}")),
     };
     Ok(base_units / 1e6)
+}
+
+/// Polymarket account value: pUSD collateral plus the mark-to-market value of every held share.
+///
+/// Cash is [`get_poly_balance`] verbatim — the same number sizing spends from, retried on its own
+/// budget. The share half is [`get_poly_marked_positions`].
+///
+/// **Fail-closed:** if any held position cannot be priced this returns `Err` rather than a partial
+/// sum. A silently short total reads as a drawdown, and the caller of this function stops a live
+/// bot on a drawdown.
+pub async fn get_poly_portfolio(trader: &crate::trade::PolyTrader) -> Result<PortfolioValue> {
+    let cash = get_poly_balance(trader).await?;
+    let positions = marked_total(&get_poly_marked_positions().await?);
+    Ok(PortfolioValue { cash, positions })
+}
+
+/// Every Polymarket position with the venue's own mark.
+///
+/// The data API publishes `currentValue` (= `size × curPrice`) on every row, so no book has to be
+/// walked: `curPrice` is Polymarket's mark for the token and `currentValue` is that mark applied
+/// to the exact size held, including its rounding. Verified 2026-09-03 against the live
+/// `POLY_FUNDER` wallet — six rows, `currentValue` and `curPrice` present on every one, and
+/// `currentValue == size × curPrice` to the cent on all six. A resolved loser reports
+/// `currentValue: 0` with `redeemable: true`, which is a correct valuation and not a missing mark;
+/// only an **absent** field is an error.
+///
+/// Retried on the balance budget rather than the market-read one, for the same reason: this is off
+/// the quoting path, and riding out a minutes-long data-API wobble beats failing a breaker check.
+pub async fn get_poly_marked_positions() -> Result<Vec<MarkedPosition>> {
+    const MAX_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY_SEC: u64 = 15;
+
+    let mut last_err = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match get_poly_marked_positions_once().await {
+            Ok(positions) => return Ok(positions),
+            Err(e) => {
+                log_event(
+                    "Balances",
+                    &format!(
+                        "get_poly_marked_positions attempt {attempt}/{MAX_ATTEMPTS} failed: {e:#}"
+                    ),
+                );
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SEC)).await;
+                } else {
+                    let msg = format!(
+                        "get_poly_marked_positions : max attempts ({MAX_ATTEMPTS}) reached, giving up: {:#}",
+                        last_err.as_ref().unwrap()
+                    );
+                    println!("[{}] : {msg}", get_timestamp_ist());
+                    log_event("Balances", &msg);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+async fn get_poly_marked_positions_once() -> Result<Vec<MarkedPosition>> {
+    fetch_poly_position_rows()
+        .await?
+        .iter()
+        .map(parse_marked_position)
+        .collect()
+}
+
+/// Split out from [`get_poly_marked_positions`] so the wire shape can be tested against captured
+/// JSON. A row missing `currentValue` or `curPrice` is an `Err` — never a zero.
+fn parse_marked_position(position: &Value) -> Result<MarkedPosition> {
+    let asset = position
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("position missing asset"))?;
+    let shares = position
+        .get("size")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("position {asset} missing size"))?;
+    let avg_price = position
+        .get("avgPrice")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("position {asset} missing avgPrice"))?;
+    let mark = position
+        .get("curPrice")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("position {asset} missing curPrice — cannot be marked"))?;
+    let value = position
+        .get("currentValue")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow!("position {asset} missing currentValue — cannot be marked"))?;
+    Ok(MarkedPosition {
+        id: asset.to_string(),
+        shares,
+        avg_price,
+        mark,
+        value,
+        source: MarkSource::Venue,
+    })
 }
 
 /// Open orders resting on the Polymarket CLOB for the account the L2 credentials are bound to,
@@ -691,6 +808,61 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Captured live from `GET https://data-api.polymarket.com/positions?...&user=POLY_FUNDER`
+    /// (2026-09-03), trimmed to the fields the mark reads plus a couple that prove the rest is
+    /// ignored. Two rows: an open position, and a resolved loser reporting `currentValue: 0` with
+    /// `redeemable: true`.
+    const POSITIONS_JSON: &str = r#"[
+      {"asset":"21294592205022969346730955103773391901993330222644504059576935265667917187903",
+       "size":40.0,"avgPrice":0.1549,"initialValue":6.196,"currentValue":4.42,"curPrice":0.1105,
+       "redeemable":false,"title":"Will no Fed rate cuts happen in 2026?"},
+      {"asset":"62429084067171308316390058541012087925567325563248051217584518806867987132248",
+       "size":46.2418,"avgPrice":0.2586,"initialValue":11.9599,"currentValue":0,"curPrice":0,
+       "redeemable":true,"title":"Will LeBron James play for the Miami Heat in 2026-27?"}
+    ]"#;
+
+    fn rows(json: &str) -> Vec<Value> {
+        serde_json::from_str::<Value>(json).unwrap().as_array().unwrap().clone()
+    }
+
+    /// The live shape marks straight off the venue's own `currentValue`, and a resolved loser's
+    /// zero is a valuation, not a missing mark.
+    #[test]
+    fn real_positions_mark_at_the_venue_value() {
+        let marked: Vec<MarkedPosition> =
+            rows(POSITIONS_JSON).iter().map(|r| parse_marked_position(r).unwrap()).collect();
+        assert_eq!(marked.len(), 2);
+        assert_eq!(marked[0].shares, 40.0);
+        assert_eq!(marked[0].avg_price, 0.1549);
+        assert_eq!(marked[0].mark, 0.1105);
+        assert_eq!(marked[0].value, 4.42);
+        assert_eq!(marked[0].source, MarkSource::Venue);
+        // `currentValue` is the venue's own `size × curPrice`, to the cent.
+        assert!((marked[0].value - marked[0].shares * marked[0].mark).abs() < 1e-6);
+        assert_eq!(marked[1].value, 0.0);
+        assert_eq!(marked_total(&marked), 4.42);
+    }
+
+    /// A flat account is an empty array, not an error, and sums to zero.
+    #[test]
+    fn a_flat_account_marks_to_zero() {
+        assert_eq!(marked_total(&[]), 0.0);
+        assert!(rows("[]").is_empty());
+    }
+
+    /// **Fail-closed.** A row with no `currentValue` is an `Err`, never a zero folded into the
+    /// sum: a silently short total reads as a drawdown, and the breaker stops a live bot on one.
+    #[test]
+    fn a_row_missing_its_mark_is_an_error_not_a_short_total() {
+        let no_value = json!({"asset":"111","size":40.0,"avgPrice":0.1549,"curPrice":0.1105});
+        let err = parse_marked_position(&no_value).unwrap_err().to_string();
+        assert!(err.contains("currentValue"), "{err}");
+
+        let no_price = json!({"asset":"111","size":40.0,"avgPrice":0.1549,"currentValue":4.42});
+        let err = parse_marked_position(&no_price).unwrap_err().to_string();
+        assert!(err.contains("curPrice"), "{err}");
+    }
 
     /// A market object shaped like the live world-cup-winner capture (2026-07-18, feeType
     /// sports_fees_v2), trimmed to the fields the pipeline touches plus one stray field to
