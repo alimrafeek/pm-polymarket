@@ -416,8 +416,18 @@ impl PolyTrader {
     /// One cheap round trip whose only job is to keep this client's pooled connection alive, so an
     /// order never has to open a cold one (see [`crate::trade_common::venue_http_builder`] for why
     /// that matters). `/balance-allowance` is the same host, the same pooled connection and the
-    /// same L2 signing path `/order` uses, so a heartbeat that passes is evidence the next order
-    /// can actually be sent. The balance it returns is discarded — the balance tracker owns that.
+    /// same L2 signing path `/order` uses, so a passing beat is evidence of exactly that much: the
+    /// route is open, the TLS session is warm, and the L2 credentials still sign. The balance it
+    /// returns is discarded — the balance tracker owns that.
+    ///
+    /// **It is not evidence that an order can be sent.** `/balance-allowance` is a **read**, and a
+    /// CLOB pause kills only *writes*. On 2026-09-02 every `POST /order` answered
+    /// `HTTP 503 {"error":"trading is disabled"}` for 3 h 27 m while this ping returned 200 on
+    /// every beat — the bot logged `polymarket: 0/61 heartbeats failed (0.0%)` for each hour of the
+    /// outage, and that silence is what let 244 orders be re-sent into a venue that was refusing
+    /// all of them. Write availability has its own gate on the engine side (`PolyGate`, and the
+    /// in-band tripwire that reads the 503 out of the rejection this method never sees); a green
+    /// heartbeat says nothing about it and must never be read as if it did.
     pub async fn ping(&self) -> Result<()> {
         let path = "/balance-allowance";
         let headers = self.l2_headers(now_ts(), "GET", path, "")?;
