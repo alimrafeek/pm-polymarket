@@ -234,6 +234,13 @@ async fn run_one_connection(
         let outcome = connect_and_run(&conn, &live, &books, &verdict).await;
 
         if let Some(missing) = verdict.into_inner() {
+            // Stop quoting anything the venue declined to confirm, now rather than at the fifth
+            // strike. Blanking an already-empty book is a no-op, so this costs nothing on a token
+            // that never had levels; it exists for the one that was healthy for hours and then
+            // went dark, which is the case that can put a real but stale price in front of the
+            // arb engine.
+            blank_books(&books_to_blank(&missing, live.len()), &books).await;
+
             if intake {
                 report_recoveries(&conn, &live, &missing, &mut recovered, &books);
             }
@@ -274,6 +281,28 @@ async fn run_one_connection(
         }
         time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Which books to clear when a snapshot deadline finds `missing` of `total` subscribed assets
+/// silent. Sorted, and empty when there is nothing to do.
+///
+/// A **partial** miss is a statement about tokens: the connection demonstrably works — other
+/// assets on it snapshotted — so the ones that stayed silent are markets the venue has stopped
+/// confirming, and their levels must stop being quotable immediately.
+///
+/// A miss of **everything** is a statement about the socket, not about any token: the subscription
+/// was silently ignored, which is the failure the chunking and the watchdog exist for. It says
+/// nothing about any individual market, and the reconnect a second later re-snapshots the lot — so
+/// blanking here would take a whole shard's markets dark on every transient subscribe hiccup, for
+/// no information gained. Those books are left alone, and the prune blanks them later if the
+/// silence turns out to be real.
+fn books_to_blank(missing: &HashSet<String>, total: usize) -> Vec<String> {
+    if missing.is_empty() || missing.len() >= total {
+        return Vec::new();
+    }
+    let mut silent: Vec<String> = missing.iter().cloned().collect();
+    silent.sort();
+    silent
 }
 
 /// Apply one snapshot verdict to the running strike counts, returning the tokens that just reached
@@ -427,10 +456,14 @@ async fn connect_and_run(
     let result = tokio::select! {
         r = read_loop(&mut read, books, &pending, &last_data_at, conn) => r,
         missing = snapshot_watch(&pending, SNAPSHOT_TIMEOUT, verdict) => Err(anyhow!(
-            "watchdog: {}/{} asset(s) never sent an initial book snapshot within {:?}: {}",
+            "watchdog: {}/{} asset(s) never sent an initial book snapshot within {:?}{}: {}",
             missing.len(),
             asset_ids.len(),
             SNAPSHOT_TIMEOUT,
+            // `run_one_connection` blanks these on the way out — but only on a partial miss; an
+            // all-miss is a socket failure and leaves the books for the reconnect. See
+            // [`books_to_blank`].
+            if missing.len() < asset_ids.len() { ", books blanked" } else { "" },
             describe_assets(&missing, books, MAX_NAMED_ASSETS)
         )),
         () = idle_watch(&last_data_at, IDLE_TIMEOUT) => Err(anyhow!(
@@ -760,6 +793,26 @@ mod tests {
         assert_eq!(strikes.get("gone"), Some(&3), "unchanged: it is not in `live`");
     }
 
+    /// The connection works and named the tokens that did not answer, so those stop being
+    /// quotable at once — four strikes before the prune would otherwise get around to it.
+    #[test]
+    fn a_partial_miss_blanks_exactly_the_silent_tokens() {
+        assert_eq!(books_to_blank(&missing_set(&["c", "a"]), 3), ids(&["a", "c"]));
+    }
+
+    /// Zero snapshots is a broken socket, not a statement about any market. Blanking here would
+    /// take a whole shard dark on every transient subscribe hiccup, so it is deliberately left to
+    /// the reconnect — and to the prune, if the silence turns out to be real.
+    #[test]
+    fn an_all_silent_verdict_blanks_nothing() {
+        assert!(books_to_blank(&missing_set(&["a", "b", "c"]), 3).is_empty());
+    }
+
+    #[test]
+    fn a_healthy_verdict_blanks_nothing() {
+        assert!(books_to_blank(&missing_set(&[]), 3).is_empty());
+    }
+
     #[tokio::test]
     async fn a_parked_token_is_withheld_until_its_sit_out_expires() {
         let pool = RehabPool::new();
@@ -823,6 +876,65 @@ mod tests {
         let live = &books["live"];
         assert_eq!(live.bids.lock().await.len(), 1, "an unrelated token is untouched");
         assert_eq!(live.asks.lock().await.len(), 1);
+    }
+
+    /// A `book` frame with empty sides is the venue **confirming** the market is empty, and must
+    /// clear whatever the book was holding — the snapshot assignment is wholesale, never a merge.
+    ///
+    /// Pinned here because it rests on a detail of another crate: `parse_levels` returns
+    /// `Ok(vec![])` for a missing or non-array field rather than an error. Harden that into an
+    /// `Err` and `apply_book_snapshot`'s `?` would return early, leaving stale levels quotable —
+    /// and an error on `asks` alone would leave the book half applied, with new bids against old
+    /// asks. That is a crossed book the arb engine would happily price.
+    #[tokio::test]
+    async fn an_empty_snapshot_clears_a_populated_book() {
+        let books: HashMap<String, PolyTokenBook> =
+            [("t".to_string(), book_with_levels("Market / YES"))].into_iter().collect();
+
+        apply_book_snapshot(
+            &json!({ "event_type": "book", "asset_id": "t", "bids": [], "asks": [] }),
+            &books,
+        )
+        .await
+        .unwrap();
+
+        assert!(books["t"].bids.lock().await.is_empty(), "the venue said empty");
+        assert!(books["t"].asks.lock().await.is_empty());
+        assert_eq!(*books["t"].tick_size.lock().await, 0.01, "metadata is not a quote");
+    }
+
+    /// Same rule when the venue omits the sides entirely instead of sending empty arrays.
+    #[tokio::test]
+    async fn a_snapshot_omitting_both_sides_clears_the_book() {
+        let books: HashMap<String, PolyTokenBook> =
+            [("t".to_string(), book_with_levels("Market / YES"))].into_iter().collect();
+
+        apply_book_snapshot(&json!({ "event_type": "book", "asset_id": "t" }), &books)
+            .await
+            .unwrap();
+
+        assert!(books["t"].bids.lock().await.is_empty());
+        assert!(books["t"].asks.lock().await.is_empty());
+    }
+
+    /// A blank snapshot still counts as delivered: the subscription demonstrably works, so the
+    /// token is healthy, keeps its place, and never strikes toward a prune. Silence and a
+    /// confirmed-empty book are different signals and must not collapse into one.
+    #[tokio::test]
+    async fn a_blank_snapshot_still_clears_the_watchdog() {
+        let books: HashMap<String, PolyTokenBook> =
+            [("t".to_string(), book_with_levels("Market / YES"))].into_iter().collect();
+        let pending: Mutex<HashSet<String>> = Mutex::new(missing_set(&["t"]));
+
+        handle_event(
+            &json!({ "event_type": "book", "asset_id": "t", "bids": [], "asks": [] }),
+            &books,
+            &pending,
+        )
+        .await
+        .unwrap();
+
+        assert!(pending.lock().await.is_empty(), "it answered, so it is not silent");
     }
 
     /// The prune log gets every name; the reconnect chatter gets a capped sample plus a count.
