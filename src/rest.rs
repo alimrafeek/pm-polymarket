@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::types::{PolymarketFeeSchedule, PolymarketMarketDetails, DEFAULT_MIN_ORDER_SIZE};
-use venue_core::log::{get_timestamp_ist, log_event};
+use venue_core::log::{get_timestamp_ist, log_event, MarketSkip};
 use venue_core::trade::{marked_total, MarkSource, MarkedPosition, PortfolioValue};
 
 fn get_value(obj: &Value, key: &str) -> Value {
@@ -78,7 +78,13 @@ const MARKET_FIELDS: [&str; 16] = [
 
 /// Gamma event lookup for one config slug, wrapped in the venue-standard read retry (3 attempts,
 /// 2 s apart) so a transient Gamma failure doesn't drop the whole Polymarket leg for the run.
-pub async fn get_poly_market_data(slug: String) -> Result<Vec<PolymarketMarketDetails>> {
+///
+/// Returns the tradeable markets **and** the outcomes this event carried that were dropped on the
+/// way (see [`MarketSkip`]) — the caller's startup report names them, since a dropped outcome is
+/// indistinguishable from one the venue never listed once it is off this Vec.
+pub async fn get_poly_market_data(
+    slug: String,
+) -> Result<(Vec<PolymarketMarketDetails>, Vec<MarketSkip>)> {
     const MAX_ATTEMPTS: u32 = 3;
     const RETRY_DELAY_SEC: u64 = 2;
 
@@ -109,7 +115,9 @@ pub async fn get_poly_market_data(slug: String) -> Result<Vec<PolymarketMarketDe
 }
 
 /// One attempt of [`get_poly_market_data`].
-async fn fetch_poly_market_data(slug: &str) -> Result<Vec<PolymarketMarketDetails>> {
+async fn fetch_poly_market_data(
+    slug: &str,
+) -> Result<(Vec<PolymarketMarketDetails>, Vec<MarketSkip>)> {
     let url = format!(
         "https://gamma-api.polymarket.com/events?slug={}",
         slug
@@ -206,9 +214,7 @@ async fn fetch_poly_market_data(slug: &str) -> Result<Vec<PolymarketMarketDetail
         return Err(anyhow!("No events found for slug '{}'", slug));
     }
     let market_data = final_events[0].clone();
-    let market_details = parse_market_detail(market_data).await?;
-
-    Ok(market_details)
+    parse_market_detail(market_data).await
 }
 
 /// Rows per `GET /positions` page. The data API caps a response at 500, so this is one request
@@ -624,7 +630,9 @@ pub async fn cancel_poly_order(
     Ok(serde_json::from_str(&text)?)
 }
 
-async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails>> {
+async fn parse_market_detail(
+    value: Value,
+) -> Result<(Vec<PolymarketMarketDetails>, Vec<MarketSkip>)> {
     let markets = value
         .get("markets")
         .and_then(|v| v.as_array())
@@ -643,9 +651,19 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
     let is_single_market = markets.len() == 1;
 
     let mut result = Vec::new();
-    let mut untradeable = 0usize;
+    let mut skipped: Vec<MarketSkip> = Vec::new();
 
     for market in markets {
+        // What to call this outcome in a skip line. `groupItemTitle` is the outcome name on a
+        // multi-market event and is absent on a binary one, where the event slug is the only name
+        // there is — `question`/`slug` are stripped by `pick_fields` long before this runs.
+        let display_name = market
+            .get("groupItemTitle")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| outer_slug.to_string());
+
         // A live event can still nest dead outcomes — long shots that were closed, de-listed, or
         // had their book switched off while the event itself runs on. Gamma keeps returning them
         // and the CLOB still knows their token ids, but the WS never sends a `book` frame for a
@@ -663,7 +681,21 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
             || !flag("active", true)
             || !flag("acceptingOrders", true)
         {
-            untradeable += 1;
+            // Name the flag that did it rather than the whole disjunction: `closed` on a live event
+            // is a resolved long shot, `acceptingOrders: false` is the venue switching a book off,
+            // and those are different things to see in a startup report.
+            let why = [
+                ("closed", true, "closed"),
+                ("archived", true, "archived"),
+                ("active", false, "active: false"),
+                ("acceptingOrders", false, "acceptingOrders: false"),
+            ]
+            .into_iter()
+            .filter(|&(key, tripped_when_true, _)| flag(key, !tripped_when_true) == tripped_when_true)
+            .map(|(_, _, label)| label)
+            .collect::<Vec<_>>()
+            .join(", ");
+            skipped.push(MarketSkip::new(&display_name, format!("untradeable ({why})")));
             continue;
         }
 
@@ -682,6 +714,10 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
             if (yes_price == "0" && no_price == "1")
                 || (yes_price == "1" && no_price == "0")
             {
+                skipped.push(MarketSkip::new(
+                    &display_name,
+                    format!("already resolved (outcomePrices {yes_price}/{no_price})"),
+                ));
                 continue;
             }
         }
@@ -792,16 +828,7 @@ async fn parse_market_detail(value: Value) -> Result<Vec<PolymarketMarketDetails
         });
     }
 
-    if untradeable > 0 {
-        println!(
-            "[{}] : [poly] {outer_slug}: skipped {untradeable} untradeable outcome(s) \
-             (closed/archived/inactive/not accepting orders); {} kept",
-            get_timestamp_ist(),
-            result.len()
-        );
-    }
-
-    Ok(result)
+    Ok((result, skipped))
 }
 
 #[cfg(test)]
@@ -894,8 +921,9 @@ mod tests {
         assert!(picked.get("volume").is_none(), "unlisted fields must still be dropped");
 
         let event = json!({ "id": "27799", "slug": "world-cup-winner", "markets": [picked] });
-        let details = parse_market_detail(event).await.unwrap();
+        let (details, skipped) = parse_market_detail(event).await.unwrap();
         assert_eq!(details.len(), 1);
+        assert!(skipped.is_empty());
         let fs = details[0]
             .fee_schedule
             .expect("fees-enabled market must carry its schedule through the filter");
@@ -913,7 +941,7 @@ mod tests {
         raw["feesEnabled"] = json!(false);
         let picked = pick_fields(&raw, &MARKET_FIELDS);
         let event = json!({ "id": "1", "slug": "no-fees", "markets": [picked] });
-        let details = parse_market_detail(event).await.unwrap();
+        let (details, _) = parse_market_detail(event).await.unwrap();
         assert!(details[0].fee_schedule.is_none());
     }
 
@@ -949,9 +977,48 @@ mod tests {
             ],
         });
 
-        let details = parse_market_detail(event).await.unwrap();
+        let (details, skipped) = parse_market_detail(event).await.unwrap();
         assert_eq!(details.len(), 1, "only the tradeable outcome survives");
         assert_eq!(details[0].market_slug, "Spain");
+
+        // Every drop is named and reasoned, in the order the event listed them — this is what the
+        // startup report prints, and a silent count could not tell "Closed" from "NoOrders".
+        let named: Vec<(&str, &str)> =
+            skipped.iter().map(|s| (s.name.as_str(), s.reason.as_str())).collect();
+        assert_eq!(
+            named,
+            vec![
+                ("Closed", "untradeable (closed)"),
+                ("Archived", "untradeable (archived)"),
+                ("Inactive", "untradeable (active: false)"),
+                ("NoOrders", "untradeable (acceptingOrders: false)"),
+            ],
+        );
+    }
+
+    /// An outcome the market has already settled is dropped too, and — unlike before — it is
+    /// *reported*. This branch never touched the old `untradeable` counter, so a resolved long shot
+    /// left the universe with nothing printed anywhere.
+    #[tokio::test]
+    async fn resolved_outcomes_are_reported_not_silently_dropped() {
+        let mut resolved = raw_sports_market();
+        resolved["groupItemTitle"] = json!("Brazil");
+        resolved["outcomePrices"] = json!("[\"0\", \"1\"]");
+
+        let event = json!({
+            "id": "27799",
+            "slug": "world-cup-winner",
+            "markets": [
+                pick_fields(&raw_sports_market(), &MARKET_FIELDS),
+                pick_fields(&resolved, &MARKET_FIELDS),
+            ],
+        });
+
+        let (details, skipped) = parse_market_detail(event).await.unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "Brazil");
+        assert!(skipped[0].reason.contains("already resolved"), "{}", skipped[0].reason);
     }
 
     /// Markets that omit the tradeability flags are kept. `pick_fields` inserts every listed key,
@@ -962,7 +1029,7 @@ mod tests {
         let picked = pick_fields(&raw_sports_market(), &MARKET_FIELDS);
         assert!(picked["acceptingOrders"].is_null(), "fixture omits the flag");
         let event = json!({ "id": "1", "slug": "no-flags", "markets": [picked] });
-        assert_eq!(parse_market_detail(event).await.unwrap().len(), 1);
+        assert_eq!(parse_market_detail(event).await.unwrap().0.len(), 1);
     }
 
     // ---------------------------------------------------------------------------------------
