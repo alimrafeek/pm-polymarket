@@ -38,7 +38,9 @@ use serde::ser::{SerializeStruct as _, Serializer};
 use serde::Serialize;
 use serde_with::{serde_as, DefaultOnError, DisplayFromStr};
 use sha2::Sha256;
+use std::fmt;
 use std::str::FromStr as _;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -46,6 +48,10 @@ use venue_core::log::{get_timestamp_ist, log_event};
 use venue_core::trade::{
     generate_salt, parse_private_key, probe_round_trips, required_env, retry_on_connect,
     sign_digest_hex, venue_http_builder, ProbeRun, Side, VenueRejected,
+};
+use venue_core::transport::{
+    Direct, Intent, OrderIntent, RequestAuth, VenueKind, VenueRequest, VenueResponse,
+    VenueTransport,
 };
 
 pub(crate) const HOST: &str = "https://clob.polymarket.com";
@@ -88,6 +94,11 @@ const POLY_PASSPHRASE: &str = "POLY_PASSPHRASE";
 const POLY_SIGNATURE: &str = "POLY_SIGNATURE";
 const POLY_TIMESTAMP: &str = "POLY_TIMESTAMP";
 const POLY_NONCE: &str = "POLY_NONCE";
+
+// The two L2 paths the trade module itself uses. Named because the L2 HMAC signs the path, so the
+// string the signature covers and the string on the wire have to be one constant, not two literals.
+const ORDER_PATH: &str = "/order";
+const BALANCE_PATH: &str = "/balance-allowance";
 
 sol! {
     /// CLOB V2 EIP-712 order — field order matters for hashing, and so does the *name*: the
@@ -159,11 +170,41 @@ impl PolyOrderType {
         }
     }
 
+    /// Rebuild a type from the three things that travel on a `transport::OrderIntent`: the wire
+    /// string, the post-only flag and the GTD lifetime.
+    ///
+    /// Needed because the gateway signs an order an engine described, and the description has to
+    /// carry everything the signature and the body depend on. A `GTD` with no lifetime is an error
+    /// rather than a default: substituting one would produce a resting order with an expiry nobody
+    /// asked for, which the venue accepts and no log would show.
+    pub fn from_wire(wire: &str, post_only: bool, gtd_lifetime_secs: Option<u64>) -> Result<Self> {
+        match wire {
+            "FAK" => Ok(Self::Fak),
+            "FOK" => Ok(Self::Fok),
+            "GTC" => Ok(Self::Gtc { post_only }),
+            "GTD" => Ok(Self::Gtd {
+                lifetime_secs: gtd_lifetime_secs
+                    .ok_or_else(|| anyhow!("a GTD order carries no lifetime"))?,
+                post_only,
+            }),
+            other => Err(anyhow!("unknown Polymarket order type {other:?}")),
+        }
+    }
+
     /// Maker-only: the venue rejects the order instead of letting any part of it take.
     pub fn post_only(self) -> bool {
         match self {
             Self::Fak | Self::Fok => false,
             Self::Gtc { post_only } | Self::Gtd { post_only, .. } => post_only,
+        }
+    }
+
+    /// A `GTD`'s book lifetime in seconds; `None` for every other type. The inverse of the
+    /// `gtd_lifetime_secs` argument [`Self::from_wire`] takes.
+    pub fn gtd_lifetime_secs(self) -> Option<u64> {
+        match self {
+            Self::Gtd { lifetime_secs, .. } => Some(lifetime_secs),
+            _ => None,
         }
     }
 
@@ -236,14 +277,101 @@ impl PolyOrderAck {
     }
 }
 
-pub struct PolyTrader {
-    pub(crate) http: reqwest::Client,
-    signing_key: SigningKey,
+/// The L2 HMAC credential: the triple, plus the EOA the `POLY_ADDRESS` header carries.
+///
+/// **Polymarket's seam is `l2_headers` *plus* the send, not one function**
+/// (`MULTITENANT_SPLIT_SPEC.md` §2.1): auth is built per call site — `POST /order`,
+/// `/balance-allowance`, `/data/orders`, `/data/trades`, `DELETE /order` — so the way to move all
+/// of them at once is to move the header construction *into the transport*. This struct is that
+/// move, and it is now the only place the L2 secret lives.
+///
+/// It is **not** the order-signing key. That is [`PolySigner`], and the split is what lets a
+/// gateway-mode client hold neither.
+pub struct PolyL2Auth {
     eoa: Address,
     api_key: Uuid,
     api_secret_b64url: String,
     passphrase: String,
+}
+
+// Opaque on purpose: this struct *is* the credential.
+impl fmt::Debug for PolyL2Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PolyL2Auth")
+    }
+}
+
+impl RequestAuth for PolyL2Auth {
+    fn url(&self, path: &str) -> String {
+        format!("{HOST}{path}")
+    }
+
+    /// Polymarket L2 auth: HMAC-SHA256 over `{timestamp}{method}{path}{body}` with the base64url
+    /// API secret, sent alongside the address/key/passphrase/timestamp headers. `POLY_ADDRESS`
+    /// is the account the credentials are bound to. The CLOB's L1 endpoints reject contract
+    /// addresses outright (strict ecrecover — verified empirically), so credentials can only be
+    /// EOA-bound and this header carries the EOA even in the deposit-wallet flow.
+    ///
+    /// **The signed `path` excludes the query string**, matching the official clients and every
+    /// existing call site: `/balance-allowance?asset_type=…` signs `/balance-allowance`.
+    fn headers(&self, method: &str, path: &str, body: &str) -> Result<Vec<(String, String)>> {
+        let signed_path = path.split('?').next().unwrap_or(path);
+        let timestamp = now_ts();
+        let decoded = URL_SAFE
+            .decode(&self.api_secret_b64url)
+            .context("failed to base64url-decode POLY_API_SECRET")?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&decoded)
+            .map_err(|e| anyhow!("failed to init HMAC: {e}"))?;
+        mac.update(format!("{timestamp}{method}{signed_path}{body}").as_bytes());
+        let sig = URL_SAFE.encode(mac.finalize().into_bytes());
+
+        Ok(vec![
+            (POLY_ADDRESS.to_string(), self.eoa.to_string()),
+            (POLY_API_KEY.to_string(), self.api_key.to_string()),
+            (POLY_PASSPHRASE.to_string(), self.passphrase.clone()),
+            (POLY_SIGNATURE.to_string(), sig),
+            (POLY_TIMESTAMP.to_string(), timestamp.to_string()),
+        ])
+    }
+}
+
+/// The order-signing half: the owner EOA key, the deposit wallet it controls, and the L2 api key
+/// uuid the order body carries as `owner`.
+///
+/// Held only by a Direct-mode [`PolyTrader`] — and by the gateway's own, on the far side of the
+/// wire. **The EOA behind `signing_key` owns the deposit wallet and can move its funds**, which is
+/// why the gateway will only ever sign something shaped like an `Order` (§2.3).
+struct PolySigner {
+    signing_key: SigningKey,
+    eoa: Address,
+    /// The L2 api key uuid, sent as the order body's `owner` field.
+    api_key: Uuid,
     funder: Address,
+    /// The same L2 credential the transport holds, kept for the L1 key-minting endpoints
+    /// ([`PolyTrader::api_key_request`]) which do not go through the L2 path at all.
+    http: reqwest::Client,
+}
+
+impl fmt::Debug for PolySigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PolySigner")
+    }
+}
+
+pub struct PolyTrader {
+    /// Where a request goes. `Direct` for the CLI and the daemon, the gateway for an engine.
+    transport: Arc<dyn VenueTransport>,
+    /// The order-signing key and the wallet it controls. `None` in gateway mode, which is what
+    /// makes an engine unable to sign anything at all — it asks for an order and the gateway
+    /// decides.
+    signer: Option<PolySigner>,
+}
+
+// Opaque on purpose: keeps `{:?}` on anything holding a trader from ever printing key material.
+impl fmt::Debug for PolyTrader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PolyTrader({})", self.transport.label())
+    }
 }
 
 impl PolyTrader {
@@ -253,45 +381,181 @@ impl PolyTrader {
     /// (the deposit wallet holding pUSD and positions — the address under the profile icon on
     /// polymarket.com, *not* the deposit-window bridge address and not the EOA).
     pub fn from_env() -> Result<Self> {
-        let (signing_key, eoa) = parse_private_key(&required_env("POLY_PRIVATE_KEY")?)
-            .context("POLY_PRIVATE_KEY invalid")?;
-        let api_key = Uuid::parse_str(&required_env("POLY_API_KEY")?)
-            .context("POLY_API_KEY must be a UUID")?;
-        let api_secret_b64url = required_env("POLY_API_SECRET")?;
+        Self::from_parts(
+            &required_env("POLY_PRIVATE_KEY")?,
+            &required_env("POLY_API_KEY")?,
+            required_env("POLY_API_SECRET")?,
+            required_env("POLY_API_PASSPHRASE")?,
+            &required_env("POLY_FUNDER")?,
+        )
+    }
+
+    /// [`Self::from_env`] with the five values already in hand. What the gateway builds its own
+    /// trader from, so no `POLY_*` credential has to exist in any environment (§2.5).
+    pub fn from_parts(
+        private_key: &str,
+        api_key: &str,
+        api_secret_b64url: String,
+        passphrase: String,
+        funder: &str,
+    ) -> Result<Self> {
+        let (signing_key, eoa) =
+            parse_private_key(private_key).context("POLY_PRIVATE_KEY invalid")?;
+        let api_key = Uuid::parse_str(api_key).context("POLY_API_KEY must be a UUID")?;
         // Fail on a malformed secret at startup, not on the first live order.
         URL_SAFE
             .decode(&api_secret_b64url)
             .context("POLY_API_SECRET is not base64url")?;
-        let passphrase = required_env("POLY_API_PASSPHRASE")?;
-        let funder = Address::from_str(&required_env("POLY_FUNDER")?)
-            .context("POLY_FUNDER must be an EVM address")?;
+        let funder = Address::from_str(funder).context("POLY_FUNDER must be an EVM address")?;
 
         let mut default_headers = HeaderMap::new();
         default_headers.insert("User-Agent", HeaderValue::from_static("pm-arbitrage"));
         default_headers.insert("Accept", HeaderValue::from_static("*/*"));
         default_headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         default_headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-        let http = venue_http_builder()
-            .default_headers(default_headers)
-            .build()?;
+        let http = venue_http_builder().default_headers(default_headers).build()?;
 
+        let auth =
+            Arc::new(PolyL2Auth { eoa, api_key, api_secret_b64url, passphrase });
         Ok(Self {
-            http,
-            signing_key,
-            eoa,
-            api_key,
-            api_secret_b64url,
-            passphrase,
-            funder,
+            transport: Arc::new(Direct::new(http.clone(), auth)),
+            signer: Some(PolySigner { signing_key, eoa, api_key, funder, http }),
         })
     }
 
-    pub fn eoa(&self) -> Address {
-        self.eoa
+    /// A trader that holds **no credential at all**: neither the L2 triple nor the EOA key. Every
+    /// authenticated read and cancel is delivered by `transport`, and an order is *asked for* as a
+    /// `VenueOp::Order` rather than signed here.
+    pub fn via_transport(transport: Arc<dyn VenueTransport>) -> Self {
+        Self { transport, signer: None }
     }
 
+    /// The signing key and wallet, or an error naming why there is none.
+    fn signer(&self) -> Result<&PolySigner> {
+        self.signer.as_ref().context(
+            "this PolyTrader holds no signing key (it routes through the gateway), so it cannot \
+             sign locally",
+        )
+    }
+
+    /// The owner EOA. **`Address::ZERO` in gateway mode**, where this process genuinely does not
+    /// know it: only the CLI reads this (a startup line and the `poly-*` manual commands), and the
+    /// CLI is always Direct.
+    pub fn eoa(&self) -> Address {
+        self.signer.as_ref().map_or(Address::ZERO, |s| s.eoa)
+    }
+
+    /// The deposit wallet. `Address::ZERO` in gateway mode — see [`Self::eoa`].
     pub fn funder(&self) -> Address {
-        self.funder
+        self.signer.as_ref().map_or(Address::ZERO, |s| s.funder)
+    }
+
+    /// One authenticated read, through whichever transport this trader has. The shared entry point
+    /// for `rest.rs`'s L2 GETs, which used to build headers and a request each.
+    pub(crate) async fn authed_get(&self, path_and_query: &str) -> Result<VenueResponse> {
+        self.transport
+            .send(VenueRequest::http(
+                VenueKind::Poly,
+                Intent::Read,
+                "GET",
+                path_and_query,
+                None,
+            ))
+            .await
+    }
+
+    /// One authenticated `DELETE` with a body — the cancel path. [`Intent::Cancel`] rather than
+    /// [`Intent::Read`]: a cancel only ever reduces exposure, so it rides the urgent half of the
+    /// fleet budget and is never refused on a cap.
+    pub(crate) async fn authed_delete(
+        &self,
+        path: &str,
+        body: String,
+    ) -> Result<VenueResponse> {
+        self.transport
+            .send(VenueRequest::http(
+                VenueKind::Poly,
+                Intent::Cancel,
+                "DELETE",
+                path,
+                Some(body),
+            ))
+            .await
+    }
+
+    /// **The gateway's side of the wire.** One L2-authed request, sent verbatim, with the venue's
+    /// own status and body handed back untouched.
+    ///
+    /// A proxy, not a caller: the CLOB's answer is not parsed, not classified and not logged here,
+    /// because all three are the engine's — the `PolyGate` tripwire reads the 503/425 out of the
+    /// rejection (`Architecture.md` §4.11.1) and would never see it if the gateway had already
+    /// turned it into something else.
+    pub async fn proxy(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<VenueResponse> {
+        let intent = match method {
+            "POST" => Intent::Order,
+            "DELETE" => Intent::Cancel,
+            _ => Intent::Read,
+        };
+        self.transport
+            .send(VenueRequest::http(VenueKind::Poly, intent, method, path, body))
+            .await
+            .with_context(|| format!("proxying {method} {path} to Polymarket"))
+    }
+
+    /// **The gateway signs an order.** Build, sign and send the order an engine asked for, and hand
+    /// back the CLOB's raw answer.
+    ///
+    /// Every field here came off the wire from a process holding no key, so the *policy has already
+    /// checked each one* (`gateway::TenantPolicy::check_order`) before this is reached — token in
+    /// the tenant's universe, notional inside the cap. What this method adds is the two fields the
+    /// engine never gets to name: `maker` and `signer`, which are this trader's own deposit wallet.
+    /// An engine cannot express an order against a different wallet, because there is nowhere in an
+    /// `OrderIntent` to put one.
+    ///
+    /// Routed through [`Self::place_order`] rather than reimplementing the build: one order-signing
+    /// implementation per venue, the one the CLI has been running against all along. The ack it
+    /// parses is discarded — the engine parses its own from the body below — but the venue's answer
+    /// is what travels back, so an ack the gateway could not parse is still reported as the bytes
+    /// the venue sent.
+    pub async fn place_order_from_intent(&self, intent: &OrderIntent) -> Result<VenueResponse> {
+        let price: Decimal = intent
+            .price
+            .parse()
+            .with_context(|| format!("order price {:?} is not a decimal", intent.price))?;
+        let size: Decimal = intent
+            .size
+            .parse()
+            .with_context(|| format!("order size {:?} is not a decimal", intent.size))?;
+        let tick_size: Decimal = intent
+            .tick_size
+            .as_deref()
+            .context("a Polymarket order intent must carry a tick size")?
+            .parse()
+            .with_context(|| format!("tick size {:?} is not a decimal", intent.tick_size))?;
+        let order_type = PolyOrderType::from_wire(
+            intent.order_type.as_deref().context("a Polymarket order intent must carry a type")?,
+            intent.post_only,
+            intent.gtd_lifetime_secs,
+        )?;
+
+        // `send_order` rather than `place_order`: the engine parses its own ack and its `PolyGate`
+        // keys on the HTTP status of a refusal, so the venue's answer travels back untouched.
+        self.send_order(
+            &intent.market,
+            &intent.token_id,
+            intent.side,
+            price,
+            size,
+            tick_size,
+            intent.neg_risk,
+            order_type,
+        )
+        .await
     }
 
     /// Place an order for `size` shares at limit `price`, with `order_type` deciding what the
@@ -320,68 +584,17 @@ impl PolyTrader {
         neg_risk: bool,
         order_type: PolyOrderType,
     ) -> Result<PolyOrderAck> {
-        log_event(
-            market_subtitle,
-            &format!(
-                "polymarket place_order : {side:?} {size} @ {price} (tick {tick_size}, {} post_only={})",
-                order_type.wire(),
-                order_type.post_only()
-            ),
-        );
-        let token_id = U256::from_str(token_id)
-            .map_err(|e| anyhow!("invalid Polymarket token id: {e:?}"))?;
-        let tick_size = tick_size.normalize();
-        let price = price.round_dp(tick_size.scale()).normalize();
-        let size = size.trunc_with_scale(LOT_SIZE_SCALE).normalize();
-        // Before signing: a lifetime the CLOB would refuse is worth catching here, not after the
-        // signature work.
-        let expiration = order_type.expiration(now_ts())?;
-
-        let order = build_limit_order(token_id, price, size, side, tick_size, self.funder)?;
-
-        let exchange_contract = if neg_risk {
-            EXCHANGE_CONTRACT_NEG_RISK_V2
-        } else {
-            EXCHANGE_CONTRACT_NORMAL_V2
-        };
-        let domain = Eip712Domain {
-            name: Some(ORDER_NAME.into()),
-            version: Some(ORDER_VERSION.into()),
-            chain_id: Some(U256::from(CHAIN_ID)),
-            verifying_contract: Some(exchange_contract),
-            ..Eip712Domain::default()
-        };
-        let signature_hex = sign_order_erc7739(&self.signing_key, &order, &domain)?;
-
-        let payload = SignedOrderPayload {
-            order,
-            // Sent on the wire (only GTD uses it) but not part of the V2 signature, which is why
-            // it can be stamped onto an order that was already signed without it.
-            expiration,
-            signature_hex,
-            order_type,
-            owner: self.api_key,
-            post_only: order_type.post_only(),
-            defer_exec: false,
-        };
-        let body = serde_json::to_string(&payload)?;
-
-        let what = format!("polymarket order {} {side:?} {size} @ {price}", order_type.wire());
-        let resp = retry_on_connect(market_subtitle, &what, || self.post_order_once(&body)).await?;
-
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        // Raw venue response, printed unconditionally: the parsed ack keeps only a subset of the
-        // fields, and rejection bodies otherwise surface only through the returned Err.
-        println!("[{}] : [poly] POST /order response: HTTP {status}: {text}", get_timestamp_ist());
-        log_event(
-            market_subtitle,
-            &format!("polymarket POST /order response: HTTP {status}: {text}"),
-        );
-        if !status.is_success() {
+        let resp = self
+            .send_order(
+                market_subtitle, token_id, side, price, size, tick_size, neg_risk, order_type,
+            )
+            .await?;
+        let status = resp.status;
+        let text = resp.body;
+        if !(200..300).contains(&status) {
             // Typed cause alongside the message: a 4xx here is proof the CLOB matched nothing,
             // which is what lets a flatten retry safely (see `is_definitive_no_fill`).
-            return Err(anyhow::Error::new(VenueRejected { status: status.as_u16() })
+            return Err(anyhow::Error::new(VenueRejected { status })
                 .context(format!("Polymarket order rejected: HTTP {status}: {text}")));
         }
         let ack: PolyOrderAck = serde_json::from_str(&text)
@@ -396,21 +609,141 @@ impl PolyTrader {
         Ok(ack)
     }
 
-    /// One `POST /order` send, as [`Self::place_order`]'s retryable unit.
+    /// [`Self::place_order`] without the interpretation: build, sign, send, and hand back the
+    /// CLOB's own status and body.
     ///
-    /// `body` is the already-signed order and is reused byte-identically across attempts — same
-    /// salt, same signature — so a replay is recognisable to the CLOB as the same order rather
-    /// than a second one. The L2 headers, by contrast, must be rebuilt per attempt: the HMAC
-    /// covers a timestamp the venue rejects once stale.
-    async fn post_order_once(&self, body: &str) -> Result<reqwest::Response> {
-        let headers = self.l2_headers(now_ts(), "POST", "/order", body)?;
-        self.http
-            .post(format!("{HOST}/order"))
-            .headers(headers)
-            .body(body.to_string())
-            .send()
-            .await
-            .context("POST /order to Polymarket failed")
+    /// Split out for the gateway (§2.2). A proxy must pass the venue's answer through untouched —
+    /// the `PolyGate` tripwire keys on the HTTP status of a rejection (`Architecture.md` §4.11.1)
+    /// and the engine parses its own ack — so the classification that [`Self::place_order`] does
+    /// has to happen on the *engine's* side of the wire, not here. One build-and-sign
+    /// implementation serves both.
+    ///
+    /// `Err` means the request never got an answer (a connect failure, an unusable field). A venue
+    /// refusal is `Ok` with the refusing status.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_order(
+        &self,
+        market_subtitle: &str,
+        token_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        tick_size: Decimal,
+        neg_risk: bool,
+        order_type: PolyOrderType,
+    ) -> Result<VenueResponse> {
+        log_event(
+            market_subtitle,
+            &format!(
+                "polymarket place_order : {side:?} {size} @ {price} (tick {tick_size}, {} post_only={})",
+                order_type.wire(),
+                order_type.post_only()
+            ),
+        );
+        // Snapped **before** the mode split, deliberately: in gateway mode these are the numbers
+        // that travel in the `OrderIntent`, so the policy's notional cap and the gateway's own
+        // re-snap see the same values rather than ones a tick apart. In Direct mode nothing moves —
+        // the snap is idempotent, and the gateway re-runs it on the far side either way.
+        let tick_size = tick_size.normalize();
+        let price = price.round_dp(tick_size.scale()).normalize();
+        let size = size.trunc_with_scale(LOT_SIZE_SCALE).normalize();
+        let what = format!("polymarket order {} {side:?} {size} @ {price}", order_type.wire());
+        let resp = match self.signer.as_ref() {
+            // Direct: this process holds the key, so it builds, signs and sends exactly as before.
+            Some(signer) => {
+                let token_id = U256::from_str(token_id)
+                    .map_err(|e| anyhow!("invalid Polymarket token id: {e:?}"))?;
+                // Before signing: a lifetime the CLOB would refuse is worth catching here, not
+                // after the signature work.
+                let expiration = order_type.expiration(now_ts())?;
+
+                let order =
+                    build_limit_order(token_id, price, size, side, tick_size, signer.funder)?;
+
+                let exchange_contract = if neg_risk {
+                    EXCHANGE_CONTRACT_NEG_RISK_V2
+                } else {
+                    EXCHANGE_CONTRACT_NORMAL_V2
+                };
+                let domain = Eip712Domain {
+                    name: Some(ORDER_NAME.into()),
+                    version: Some(ORDER_VERSION.into()),
+                    chain_id: Some(U256::from(CHAIN_ID)),
+                    verifying_contract: Some(exchange_contract),
+                    ..Eip712Domain::default()
+                };
+                let signature_hex = sign_order_erc7739(&signer.signing_key, &order, &domain)?;
+
+                let payload = SignedOrderPayload {
+                    order,
+                    // Sent on the wire (only GTD uses it) but not part of the V2 signature, which
+                    // is why it can be stamped onto an order that was already signed without it.
+                    expiration,
+                    signature_hex,
+                    order_type,
+                    owner: signer.api_key,
+                    post_only: order_type.post_only(),
+                    defer_exec: false,
+                };
+                let body = serde_json::to_string(&payload)?;
+                // `body` is reused byte-identically across attempts — same salt, same signature —
+                // so a replay is recognisable to the CLOB as the same order rather than a second
+                // one. Only the L2 headers are rebuilt per attempt, inside the transport.
+                retry_on_connect(market_subtitle, &what, || {
+                    self.transport.send(VenueRequest::http(
+                        VenueKind::Poly,
+                        Intent::Order,
+                        "POST",
+                        ORDER_PATH,
+                        Some(body.clone()),
+                    ))
+                })
+                .await?
+            }
+            // Gateway: this process holds no key, so it *asks* for an order. Every field the signed
+            // struct commits to travels in plain sight and the gateway checks each one before it
+            // signs (§2.3); `maker`/`signer` are not fields at all, because they are the tenant's
+            // registered wallet and never the caller's to choose. No `retry_on_connect` here — the
+            // gateway's own Direct-mode trader does that, on the side of the wire where a connect
+            // failure means the bytes never left the host.
+            None => {
+                let intent = OrderIntent {
+                    market: market_subtitle.to_string(),
+                    token_id: token_id.to_string(),
+                    side,
+                    price: price.to_string(),
+                    size: size.to_string(),
+                    tick_size: Some(tick_size.to_string()),
+                    neg_risk,
+                    order_type: Some(order_type.wire().to_string()),
+                    post_only: order_type.post_only(),
+                    gtd_lifetime_secs: order_type.gtd_lifetime_secs(),
+                    topic_id: None,
+                    buy_fee_pad: None,
+                };
+                self.transport
+                    .send(VenueRequest::order(VenueKind::Poly, intent))
+                    .await
+                    .with_context(|| what.clone())?
+            }
+        };
+
+        // Raw venue response, printed unconditionally: the parsed ack keeps only a subset of the
+        // fields, and rejection bodies otherwise surface only through the returned Err.
+        println!(
+            "[{}] : [poly] POST /order response: HTTP {}: {}",
+            get_timestamp_ist(),
+            resp.status,
+            resp.body,
+        );
+        log_event(
+            market_subtitle,
+            &format!(
+                "polymarket POST /order response: HTTP {}: {}",
+                resp.status, resp.body
+            ),
+        );
+        Ok(resp)
     }
 
     /// One cheap round trip whose only job is to keep this client's pooled connection alive, so an
@@ -429,19 +762,16 @@ impl PolyTrader {
     /// in-band tripwire that reads the 503 out of the rejection this method never sees); a green
     /// heartbeat says nothing about it and must never be read as if it did.
     pub async fn ping(&self) -> Result<()> {
-        let path = "/balance-allowance";
-        let headers = self.l2_headers(now_ts(), "GET", path, "")?;
-        let response = self
-            .http
-            .get(format!("{HOST}{path}?asset_type=COLLATERAL&signature_type=3"))
-            .headers(headers)
-            .send()
+        let resp = self
+            .authed_get(&format!("{BALANCE_PATH}?asset_type=COLLATERAL&signature_type=3"))
             .await
             .context("GET /balance-allowance to Polymarket failed")?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Polymarket heartbeat rejected: HTTP {status}: {text}"));
+        if !resp.is_success() {
+            return Err(anyhow!(
+                "Polymarket heartbeat rejected: HTTP {}: {}",
+                resp.status,
+                resp.body
+            ));
         }
         Ok(())
     }
@@ -459,52 +789,28 @@ impl PolyTrader {
         probe_round_trips(samples, || self.ping()).await
     }
 
-    /// Polymarket L2 auth: HMAC-SHA256 over `{timestamp}{method}{path}{body}` with the base64url
-    /// API secret, sent alongside the address/key/passphrase/timestamp headers. `POLY_ADDRESS`
-    /// is the account the credentials are bound to. The CLOB's L1 endpoints reject contract
-    /// addresses outright (strict ecrecover — verified empirically), so credentials can only be
-    /// EOA-bound and this header carries the EOA even in the deposit-wallet flow.
-    pub(crate) fn l2_headers(
-        &self,
-        timestamp: i64,
-        method: &str,
-        path: &str,
-        body: &str,
-    ) -> Result<HeaderMap> {
-        let decoded = URL_SAFE
-            .decode(&self.api_secret_b64url)
-            .context("failed to base64url-decode POLY_API_SECRET")?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(&decoded)
-            .map_err(|e| anyhow!("failed to init HMAC: {e}"))?;
-        mac.update(format!("{timestamp}{method}{path}{body}").as_bytes());
-        let sig = URL_SAFE.encode(mac.finalize().into_bytes());
-
-        let mut h = HeaderMap::new();
-        h.insert(POLY_ADDRESS, self.eoa.to_string().parse()?);
-        h.insert(POLY_API_KEY, self.api_key.to_string().parse()?);
-        h.insert(POLY_PASSPHRASE, self.passphrase.parse()?);
-        h.insert(POLY_SIGNATURE, sig.parse()?);
-        h.insert(POLY_TIMESTAMP, timestamp.to_string().parse()?);
-        Ok(h)
-    }
-
     /// Polymarket L1 auth: a ClobAuth EIP-712 attestation whose `address` field is the account
     /// the credentials get bound to. For the deposit wallet that account is a contract, so the
     /// attestation is signed with the same ERC-7739 wrapping the wallet's ERC-1271 check needs
     /// (`wrapped: true`); a plain EOA signature is kept for probing/legacy (`wrapped: false`).
+    ///
+    /// **Direct mode only** — the L1 endpoints are the CLI's `poly-derive-key` path, they mint the
+    /// very credential the gateway is holding, and they sign with the EOA key. A gateway-mode
+    /// trader has neither the key nor any reason to mint one.
     fn l1_headers(&self, timestamp: i64, account: Address, wrapped: bool) -> Result<HeaderMap> {
+        let signer = self.signer()?;
         let nonce = 0u64;
         let ts = timestamp.to_string();
         let sig = if wrapped {
             erc7739_sign(
-                &self.signing_key,
+                &signer.signing_key,
                 account,
                 clob_auth_domain_separator(),
                 clob_auth_struct_hash(account, &ts, nonce),
                 CLOB_AUTH_TYPE,
             )?
         } else {
-            sign_digest_hex(&self.signing_key, &clob_auth_digest(account, &ts, nonce))?
+            sign_digest_hex(&signer.signing_key, &clob_auth_digest(account, &ts, nonce))?
         };
 
         let mut h = HeaderMap::new();
@@ -518,14 +824,14 @@ impl PolyTrader {
     #[allow(dead_code)]
     /// Mint a fresh L2 credential triple bound to the deposit wallet (POST /auth/api-key).
     pub async fn create_api_key(&self) -> Result<PolyApiCreds> {
-        self.api_key_request(reqwest::Method::POST, "/auth/api-key", self.funder, true)
+        self.api_key_request(reqwest::Method::POST, "/auth/api-key", self.funder(), true)
             .await
     }
 
     #[allow(dead_code)]
     /// Recover the existing deposit-wallet credential triple (GET /auth/derive-api-key).
     pub async fn derive_api_key(&self) -> Result<PolyApiCreds> {
-        self.api_key_request(reqwest::Method::GET, "/auth/derive-api-key", self.funder, true)
+        self.api_key_request(reqwest::Method::GET, "/auth/derive-api-key", self.funder(), true)
             .await
     }
 
@@ -562,6 +868,7 @@ impl PolyTrader {
     ) -> Result<PolyApiCreds> {
         let headers = self.l1_headers(now_ts(), account, wrapped)?;
         let resp = self
+            .signer()?
             .http
             .request(method.clone(), format!("{HOST}{path}"))
             .headers(headers)
@@ -861,6 +1168,41 @@ impl Serialize for SignedOrderPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transport that answers nothing. Enough to build a gateway-mode client without a
+    /// credential, a socket or a gateway — which is the point of the two tests below.
+    #[derive(Debug)]
+    struct NullTransport;
+
+    impl VenueTransport for NullTransport {
+        fn send<'a>(
+            &'a self,
+            _req: VenueRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<VenueResponse>> + Send + 'a>,
+        > {
+            Box::pin(async { anyhow::bail!("no transport in this test") })
+        }
+        fn is_direct(&self) -> bool {
+            false
+        }
+        fn label(&self) -> &'static str {
+            "gateway"
+        }
+    }
+
+    /// A gateway-mode trader holds neither the L2 credential nor the EOA key, so it cannot sign
+    /// locally and reports no wallet — which only the CLI ever reads, and the CLI is always Direct.
+    #[test]
+    fn a_gateway_mode_trader_holds_no_key() {
+        let trader = PolyTrader::via_transport(Arc::new(NullTransport));
+        // Opaque `Debug`: the transport, never key material.
+        assert_eq!(format!("{trader:?}"), "PolyTrader(gateway)");
+        assert_eq!(trader.eoa(), Address::ZERO);
+        assert_eq!(trader.funder(), Address::ZERO);
+        let err = trader.signer().expect_err("no key");
+        assert!(format!("{err:#}").contains("holds no signing key"), "{err:#}");
+    }
     use rust_decimal_macros::dec;
 
     // Anvil/Hardhat dev key #0 — public knowledge, safe to embed. Used to exercise the ERC-7739

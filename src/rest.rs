@@ -351,23 +351,12 @@ pub async fn get_poly_balance(trader: &crate::trade::PolyTrader) -> Result<f64> 
 
 async fn get_poly_balance_once(trader: &crate::trade::PolyTrader) -> Result<f64> {
     let path = "/balance-allowance";
-    let headers = trader.l2_headers(crate::trade::now_ts(), "GET", path, "")?;
-
     let response = trader
-        .http
-        .get(format!(
-            "{}{}?asset_type=COLLATERAL&signature_type=3",
-            crate::trade::HOST,
-            path
-        ))
-        .headers(headers)
-        .send()
+        .authed_get(&format!("{path}?asset_type=COLLATERAL&signature_type=3"))
         .await?;
-
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow!("GET {path} failed: HTTP {status}: {text}"));
+    let text = response.body;
+    if !(200..300).contains(&response.status) {
+        return Err(anyhow!("GET {path} failed: HTTP {}: {text}", response.status));
     }
 
     let v: Value = serde_json::from_str(&text)?;
@@ -484,19 +473,10 @@ fn parse_marked_position(position: &Value) -> Result<MarkedPosition> {
 /// as raw JSON from GET /data/orders.
 pub async fn get_poly_open_orders(trader: &crate::trade::PolyTrader) -> Result<Value> {
     let path = "/data/orders";
-    let headers = trader.l2_headers(crate::trade::now_ts(), "GET", path, "")?;
-
-    let response = trader
-        .http
-        .get(format!("{}{}", crate::trade::HOST, path))
-        .headers(headers)
-        .send()
-        .await?;
-
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow!("GET {path} failed: HTTP {status}: {text}"));
+    let response = trader.authed_get(path).await?;
+    let text = response.body;
+    if !(200..300).contains(&response.status) {
+        return Err(anyhow!("GET {path} failed: HTTP {}: {text}", response.status));
     }
 
     Ok(serde_json::from_str(&text)?)
@@ -534,19 +514,10 @@ pub async fn get_poly_order_trades(
     order_id: &str,
 ) -> Result<f64> {
     let path = "/data/trades";
-    let headers = trader.l2_headers(crate::trade::now_ts(), "GET", path, "")?;
-
-    let response = trader
-        .http
-        .get(format!("{}{}", crate::trade::HOST, path))
-        .headers(headers)
-        .send()
-        .await?;
-
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow!("GET {path} failed: HTTP {status}: {text}"));
+    let response = trader.authed_get(path).await?;
+    let text = response.body;
+    if !(200..300).contains(&response.status) {
+        return Err(anyhow!("GET {path} failed: HTTP {}: {text}", response.status));
     }
 
     let body: Value = serde_json::from_str(&text)?;
@@ -611,20 +582,10 @@ pub async fn cancel_poly_order(
 ) -> Result<Value> {
     let path = "/order";
     let body = serde_json::json!({ "orderID": order_id }).to_string();
-    let headers = trader.l2_headers(crate::trade::now_ts(), "DELETE", path, &body)?;
-
-    let response = trader
-        .http
-        .delete(format!("{}{}", crate::trade::HOST, path))
-        .headers(headers)
-        .body(body)
-        .send()
-        .await?;
-
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow!("DELETE {path} failed: HTTP {status}: {text}"));
+    let response = trader.authed_delete(path, body).await?;
+    let text = response.body;
+    if !(200..300).contains(&response.status) {
+        return Err(anyhow!("DELETE {path} failed: HTTP {}: {text}", response.status));
     }
 
     Ok(serde_json::from_str(&text)?)
