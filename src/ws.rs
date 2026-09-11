@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::{self, Duration};
 use tokio_tungstenite::connect_async;
@@ -14,6 +14,14 @@ use url::Url;
 use crate::types::PolyTokenBook;
 use venue_core::book::{as_f64_lenient, now_ms, parse_levels, sort_levels, upsert_level, ws_debug};
 use venue_core::log::{get_timestamp_ist, log_event};
+use venue_core::universe::{
+    net_change, next_batch, ChunkMap, NetChange, Registry, UnitDelta, DEBOUNCE_MAX, DEBOUNCE_QUIET,
+};
+
+/// This venue's routing map: `asset_id` → book, plus the set of assets actually subscribed.
+/// Polymarket's subscription unit and its routing key are the same thing, so every entry is its
+/// own subscription key.
+pub type PolyBooks = Registry<PolyTokenBook>;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
@@ -62,57 +70,140 @@ const PRUNE_LOG: &str = "Poly_Pruned_Tokens";
 
 /// Run the Polymarket market-data feed forever.
 ///
-/// The tracked tokens are split into chunks of at most `CHUNK_SIZE`, and each chunk gets its own
-/// multiplexed WebSocket connection with an independent reconnect loop. Every connection routes
-/// updates by `asset_id` into the shared `books` map, so it does not matter which connection
-/// delivers a given token's update. Chunking bounds each subscription (avoiding Polymarket's
-/// silent-freeze-at-scale) and isolates faults: one connection dropping only stops its own tokens
-/// updating while the others keep streaming. Note that a drop does **not** clear any book — only
-/// [`prune`] blanks levels, so a token whose connection is down keeps its last levels until the
-/// connection returns.
+/// The subscribed tokens are spread over connections of at most [`CHUNK_SIZE`] assets, each with
+/// its own reconnect loop. Every connection routes updates by `asset_id` into the shared `books`
+/// registry, so it does not matter which connection delivers a given token's update. Chunking
+/// bounds each subscription (avoiding Polymarket's silent-freeze-at-scale) and isolates faults: one
+/// connection dropping only stops its own tokens updating while the others keep streaming. Note
+/// that a drop does **not** clear any book — only [`prune`] and an explicit unsubscribe blank
+/// levels, so a token whose connection is down keeps its last levels until the connection returns.
 ///
 /// One extra connection is spawned beyond the chunks: the **rehab** connection, which owns no
 /// tokens of its own and instead re-subscribes tokens the chunks pruned, once each has sat out
 /// [`REHAB_DELAY`]. Giving rehab its own connection is the point of the design — a token that is
 /// still dark after its sit-out fails there, where the only thing it can disturb is other pruned
 /// tokens, instead of taking a hundred healthy ones down with it.
-pub async fn run_poly_ws(books: Arc<HashMap<String, PolyTokenBook>>) {
-    let mut asset_ids: Vec<String> = books.keys().cloned().collect();
-    if asset_ids.is_empty() {
-        eprintln!("[{}] : [poly-ws] no Polymarket tokens to subscribe to; not connecting", get_timestamp_ist());
-        return;
-    }
-    asset_ids.sort(); // deterministic chunk membership + log ordering
+///
+/// **Stage 4 — the universe is no longer a startup snapshot.** `deltas` carries the daemon's
+/// refcount transitions (§4.1); this task debounces a burst of them into one [`NetChange`]
+/// ([`next_batch`]) and applies it to a **persistent** [`ChunkMap`], so a token added mid-run joins
+/// the first chunk with room and every other connection on the venue is left alone. Replacing the
+/// old `keys().sorted().chunks(N)` is the whole of §4.2: that sharding is a function of the set, so
+/// one early-sorting token re-cut every chunk and would have re-snapshotted the entire venue.
+///
+/// A change to a chunk's membership **reconnects that chunk**. Polymarket is not assumed to accept
+/// an incremental subscribe on a live socket, and a reconnect costs one re-snapshot of at most 100
+/// tokens against the existing 12 s deadline — the same work a watchdog trip already does.
+pub async fn run_poly_ws(books: Arc<PolyBooks>, mut deltas: mpsc::UnboundedReceiver<UnitDelta>) {
+    let pool = Arc::new(RehabPool::new());
+    let mut map = ChunkMap::new(CHUNK_SIZE);
+    // One sender per chunk index. The index is the connection's identity for the life of the
+    // process — see [`ChunkMap`] — so this only ever grows.
+    let mut chunks: Vec<watch::Sender<Arc<Vec<String>>>> = Vec::new();
+    let mut set = JoinSet::new();
 
-    let chunks: Vec<Vec<String>> = asset_ids.chunks(CHUNK_SIZE).map(|c| c.to_vec()).collect();
+    // The rehab connection starts empty, owns no chunk, and fills from the pool as sit-outs expire.
+    {
+        let books = Arc::clone(&books);
+        let pool = Arc::clone(&pool);
+        set.spawn(async move { run_one_connection(REHAB_TAG.to_string(), None, books, pool, true).await });
+    }
+
+    // Whatever is already subscribed when this starts. The daemon activates nothing until a tenant
+    // asks (§4.1), so this is empty there and the venue opens no connection at all; the
+    // single-process binary activates its whole static universe up front, so this is the old
+    // behaviour exactly.
+    let seed = books.active_subs();
+    if !seed.is_empty() {
+        let net = NetChange { added: seed, removed: Vec::new() };
+        apply_universe(&mut map, &mut chunks, &mut set, &books, &pool, &net).await;
+    }
     println!(
-        "[{}] : [poly-ws] {} tokens across {} connection(s) (chunk size {}) + 1 rehab connection",
+        "[{}] : [poly-ws] {} token(s) across {} connection(s) (chunk size {}) + 1 rehab connection",
         get_timestamp_ist(),
-        asset_ids.len(),
-        chunks.len(),
+        map.len(),
+        map.chunk_count(),
         CHUNK_SIZE
     );
 
-    let pool = Arc::new(RehabPool::new());
+    loop {
+        tokio::select! {
+            batch = next_batch(&mut deltas, DEBOUNCE_QUIET, DEBOUNCE_MAX) => {
+                let Some(batch) = batch else {
+                    // Every sender is gone: the universe is fixed for the life of the process (the
+                    // single-process binary). The connections run on; this task has nothing left to
+                    // do but stay out of their way.
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                };
+                let net = net_change(batch);
+                if net.is_empty() {
+                    continue;
+                }
+                apply_universe(&mut map, &mut chunks, &mut set, &books, &pool, &net).await;
+            }
+            // Each connection loops forever; this only wakes if a connection task panics.
+            Some(res) = set.join_next() => {
+                if let Err(e) = res {
+                    eprintln!("[{}] : [poly-ws] connection task ended unexpectedly: {e}", get_timestamp_ist());
+                }
+            }
+        }
+    }
+}
 
-    // One independent, self-reconnecting connection per chunk.
-    let mut set = JoinSet::new();
-    for (conn, chunk) in chunks.into_iter().enumerate() {
-        let books = Arc::clone(&books);
-        let pool = Arc::clone(&pool);
-        set.spawn(async move { run_one_connection(conn.to_string(), chunk, books, pool, false).await });
+/// Apply one debounced universe change: re-point the registry, blank what left, move the chunk
+/// assignment, and hand every **touched** chunk its new set.
+///
+/// The order is load-bearing. Routing is stopped first, so not one further frame is applied to a
+/// token the fleet has dropped — the reconnect that actually withdraws the subscription is seconds
+/// away, and until it lands the venue is still streaming it. The books are blanked next for the
+/// same reason the prune blanks: nothing else in this adapter ever expires a book, so levels the
+/// feed has stopped maintaining would otherwise stay quotable forever (`Architecture.md` §4.2.1).
+///
+/// Only the chunks [`ChunkMap::apply`] names are sent a new set. That is what makes "adding a 101st
+/// token opens a second chunk and does not reconnect the first" true.
+async fn apply_universe(
+    map: &mut ChunkMap,
+    chunks: &mut Vec<watch::Sender<Arc<Vec<String>>>>,
+    set: &mut JoinSet<()>,
+    books: &Arc<PolyBooks>,
+    pool: &Arc<RehabPool>,
+    net: &NetChange,
+) {
+    books.activate(&net.added);
+    books.deactivate(&net.removed);
+    blank_books(&net.removed, books).await;
+    // A dropped token must not come back out of rehab an hour later onto a chunk nobody asked it
+    // to be on.
+    pool.forget(&net.removed).await;
+
+    let touched = map.apply(net);
+    for idx in &touched {
+        // A never-seen chunk index needs its connection task. Indices are dense and only grow, so
+        // this spawns at most one task per new chunk.
+        while chunks.len() <= *idx {
+            let conn = chunks.len().to_string();
+            let (tx, rx) = watch::channel(Arc::new(Vec::new()));
+            let books = Arc::clone(books);
+            let pool = Arc::clone(pool);
+            set.spawn(async move { run_one_connection(conn, Some(rx), books, pool, false).await });
+            chunks.push(tx);
+        }
+        let _ = chunks[*idx].send(Arc::new(map.chunk(*idx)));
     }
 
-    // The rehab connection starts empty and fills from the pool as sit-outs expire.
-    set.spawn(async move {
-        run_one_connection(REHAB_TAG.to_string(), Vec::new(), books, pool, true).await
-    });
-
-    // Each connection loops forever; this only wakes if a connection task panics.
-    while let Some(res) = set.join_next().await {
-        if let Err(e) = res {
-            eprintln!("[{}] : [poly-ws] connection task ended unexpectedly: {e}", get_timestamp_ist());
-        }
+    if !touched.is_empty() {
+        println!(
+            "[{}] : [poly-ws] universe change (+{} -{}): {} token(s) across {} connection(s); \
+             reconnecting chunk(s) {:?}",
+            get_timestamp_ist(),
+            net.added.len(),
+            net.removed.len(),
+            map.len(),
+            map.chunk_count(),
+            touched,
+        );
     }
 }
 
@@ -171,6 +262,20 @@ impl RehabPool {
         ids
     }
 
+    /// Forget parked tokens outright — the fleet no longer wants them (§4.1). Distinct from
+    /// [`Self::take_due`]: nothing is handed to rehab, the sit-out simply stops existing, so a
+    /// token unsubscribed while parked cannot resurface an hour later on a connection nobody asked
+    /// for it to be on.
+    async fn forget(&self, asset_ids: &[String]) {
+        if asset_ids.is_empty() {
+            return;
+        }
+        let mut guard = self.parked.lock().await;
+        for id in asset_ids {
+            guard.remove(id);
+        }
+    }
+
     async fn len(&self) -> usize {
         self.parked.lock().await.len()
     }
@@ -179,31 +284,53 @@ impl RehabPool {
 /// One connection's forever reconnect loop with capped backoff, plus the strike accounting that
 /// decides when a token stops being worth subscribing to.
 ///
-/// `asset_ids` is the *starting* subscription set, not a fixed one: tokens leave it when they hit
-/// [`MAX_SNAPSHOT_STRIKES`], and — on the rehab connection (`intake`) — join it as sit-outs
-/// expire. Everything else about the loop is unchanged.
+/// `assigned` is this connection's chunk membership as the supervisor maintains it — `None` for the
+/// rehab connection, which owns no chunk. The *live* subscription set is derived from it and is not
+/// the same thing: tokens leave it when they hit [`MAX_SNAPSHOT_STRIKES`], and — on the rehab
+/// connection (`intake`) — join it as sit-outs expire.
+///
+/// A change on `assigned` **reconnects** this connection with the new set (§4.3). Polymarket is not
+/// assumed to accept an incremental subscribe on a live socket, and the reconnect re-snapshots at
+/// most [`CHUNK_SIZE`] tokens against the existing 12 s deadline.
 ///
 /// A recovered token is deliberately **not** handed back to its original chunk. Books are routed
 /// by `asset_id`, so which connection delivers an update does not matter, and moving a live token
 /// between connections would cost a tear-down on both.
 async fn run_one_connection(
     conn: String,
-    asset_ids: Vec<String>,
-    books: Arc<HashMap<String, PolyTokenBook>>,
+    mut assigned: Option<watch::Receiver<Arc<Vec<String>>>>,
+    books: Arc<PolyBooks>,
     pool: Arc<RehabPool>,
     intake: bool,
 ) {
-    let mut live = asset_ids;
+    let mut live: Vec<String> = Vec::new();
     // Consecutive missed snapshots per token. An id is absent when its count is zero, so a healthy
     // connection keeps this map empty.
     let mut strikes: HashMap<String, u32> = HashMap::new();
     // Rehab only: tokens already reported as recovered, so one recovery logs one line.
     let mut recovered: HashSet<String> = HashSet::new();
+    // Tokens this connection has pruned. They belong to the rehab pool now, and re-reading the
+    // chunk assignment must not quietly hand them back — an assignment that has not changed for
+    // them is not new information, and a dead token would otherwise rejoin a healthy shard on the
+    // next unrelated market add.
+    let mut pruned_here: HashSet<String> = HashSet::new();
     let mut backoff = Duration::from_secs(1);
 
     loop {
+        if let Some(rx) = assigned.as_mut() {
+            let want = rx.borrow_and_update().clone();
+            live = apply_assignment(&live, &want, &mut pruned_here, &mut strikes);
+        }
         if intake {
-            let due = pool.take_due(REHAB_DELAY, CHUNK_SIZE.saturating_sub(live.len())).await;
+            // Rehab has no chunk assignment to be re-pointed by, so this is the only thing that
+            // ever takes a token *off* it. A token that recovered here stays here (§4.2.1), so
+            // without this an unsubscribed one would keep its subscription for the life of the
+            // process — the one place a universe change could not reach.
+            live.retain(|id| books.is_active(id));
+            let mut due = pool.take_due(REHAB_DELAY, CHUNK_SIZE.saturating_sub(live.len())).await;
+            // A token the fleet dropped while it was parked is simply let go here rather than
+            // re-subscribed; `forget` covers the ones already gone when the change landed.
+            due.retain(|id| books.is_active(id));
             if !due.is_empty() {
                 announce(
                     &conn,
@@ -221,17 +348,25 @@ async fn run_one_connection(
         }
 
         // Normally only the rehab connection, which is idle until something is pruned — but a
-        // chunk that loses every one of its tokens lands here too and idles until they are
-        // rehabilitated onto the rehab connection. Either way there is nothing to subscribe to.
+        // chunk lands here too, either before its first assignment arrives or after every one of
+        // its tokens has been unsubscribed or rehabilitated away. Either way there is nothing to
+        // subscribe to, and a chunk waits on its assignment rather than on a clock.
         if live.is_empty() {
-            time::sleep(REHAB_POLL).await;
+            match assigned.as_mut() {
+                Some(rx) => {
+                    if rx.changed().await.is_err() {
+                        return; // the supervisor is gone; so is this connection's reason to exist
+                    }
+                }
+                None => time::sleep(REHAB_POLL).await,
+            }
             continue;
         }
 
         // Filled in by `snapshot_watch` when the deadline fires, and only then: a socket that died
         // before the deadline tells us nothing about any token, and must not cost anyone a strike.
         let verdict: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-        let outcome = connect_and_run(&conn, &live, &books, &verdict).await;
+        let outcome = connect_and_run(&conn, &live, &books, &verdict, assigned.as_mut()).await;
 
         if let Some(missing) = verdict.into_inner() {
             // Stop quoting anything the venue declined to confirm, now rather than at the fifth
@@ -252,6 +387,7 @@ async fn run_one_connection(
                 // Blank before parking: an unsubscribed token receives no further updates, so
                 // whatever levels it holds would otherwise stay quotable forever.
                 blank_books(&pruned, &books).await;
+                pruned_here.extend(pruned.iter().cloned());
                 pool.park(&pruned).await;
                 announce(
                     &conn,
@@ -281,6 +417,41 @@ async fn run_one_connection(
         }
         time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Bring a connection's live subscription set in line with the chunk assignment it has just been
+/// handed, returning the new set (sorted, as the subscribe frame and every log line want it).
+///
+/// Three rules, and the third is the one that is easy to get wrong:
+///
+/// * a token no longer assigned here **leaves**, and takes its strike count with it — it is not
+///   this connection's problem any more, and a stale count would follow it back on a re-subscribe;
+/// * a token newly assigned here **joins**;
+/// * a token this connection has **pruned** does not rejoin, however often the assignment is
+///   re-read. It is parked in the rehab pool and only rehab may bring it back. Without this, any
+///   unrelated market add would re-cut the chunk's set and silently undo every prune on it.
+///
+/// A token dropped from the assignment is also released from `pruned_here`: the fleet has let it
+/// go, so if it is ever subscribed again it deserves a clean slate.
+fn apply_assignment(
+    live: &[String],
+    assigned: &[String],
+    pruned_here: &mut HashSet<String>,
+    strikes: &mut HashMap<String, u32>,
+) -> Vec<String> {
+    let want: HashSet<&String> = assigned.iter().collect();
+    strikes.retain(|id, _| want.contains(id));
+    pruned_here.retain(|id| want.contains(id));
+
+    let mut next: Vec<String> = live.iter().filter(|id| want.contains(*id)).cloned().collect();
+    for id in assigned {
+        if !next.contains(id) && !pruned_here.contains(id) {
+            next.push(id.clone());
+        }
+    }
+    next.sort();
+    next.dedup();
+    next
 }
 
 /// Which books to clear when a snapshot deadline finds `missing` of `total` subscribed assets
@@ -344,9 +515,12 @@ fn apply_strikes(
 /// `tick_size` is left alone — it is market metadata rather than a quote, and re-reading it would
 /// cost a REST call for no gain. Notifying on a removal is deliberate: a consumer parked on
 /// `change` should learn the quotes went away rather than hold a view the feed has abandoned.
-async fn blank_books(asset_ids: &[String], books: &HashMap<String, PolyTokenBook>) {
+async fn blank_books(asset_ids: &[String], books: &PolyBooks) {
     for id in asset_ids {
-        let Some(token) = books.get(id) else { continue };
+        // `unit`, not `routed`: this is called both for a token that is still subscribed (a prune)
+        // and for one whose subscription has just been withdrawn, and the second is exactly the
+        // case whose levels must stop being quotable.
+        let Some(token) = books.unit(id) else { continue };
         token.bids.lock().await.clear();
         token.asks.lock().await.clear();
         token.change.notify_one();
@@ -361,7 +535,7 @@ fn report_recoveries(
     live: &[String],
     missing: &HashSet<String>,
     recovered: &mut HashSet<String>,
-    books: &HashMap<String, PolyTokenBook>,
+    books: &PolyBooks,
 ) {
     let fresh: Vec<String> = live
         .iter()
@@ -393,8 +567,9 @@ fn announce(conn: &str, event: &str) {
 async fn connect_and_run(
     conn: &str,
     asset_ids: &[String],
-    books: &HashMap<String, PolyTokenBook>,
+    books: &PolyBooks,
     verdict: &Mutex<Option<HashSet<String>>>,
+    assigned: Option<&mut watch::Receiver<Arc<Vec<String>>>>,
 ) -> Result<()> {
     let ws_url = Url::parse(WS_URL)?;
 
@@ -470,10 +645,35 @@ async fn connect_and_run(
             "watchdog: no market data for {:?}",
             IDLE_TIMEOUT
         )),
+        // §4.3: the chunk's membership moved. Reconnect with the new set rather than trying to
+        // amend a live subscription — `Ok` so the caller treats it as a clean close and does not
+        // back off, since nothing failed.
+        () = wait_for_reassignment(assigned) => {
+            println!(
+                "[{}] : [poly-ws#{conn}] subscription set changed; reconnecting with the new one",
+                get_timestamp_ist()
+            );
+            Ok(())
+        }
     };
 
     ping_task.abort();
     result
+}
+
+/// Resolve when this connection's chunk assignment changes. A connection with no chunk — rehab —
+/// parks forever, so the branch never wins there.
+async fn wait_for_reassignment(rx: Option<&mut watch::Receiver<Arc<Vec<String>>>>) {
+    match rx {
+        Some(rx) => {
+            // An `Err` is the supervisor going away, which cannot happen while the process lives;
+            // park rather than spin if it ever does.
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Resolve once the snapshot deadline passes, returning the assets that still have not delivered
@@ -512,14 +712,10 @@ const MAX_NAMED_ASSETS: usize = 12;
 /// `limit` caps how many are named before the rest are summarised as a count: the reconnect
 /// chatter passes [`MAX_NAMED_ASSETS`], while the prune log passes `usize::MAX` — a permanent
 /// change to the quoted universe is worth every name, however long the list.
-fn describe_assets(
-    asset_ids: &[String],
-    books: &HashMap<String, PolyTokenBook>,
-    limit: usize,
-) -> String {
+fn describe_assets(asset_ids: &[String], books: &PolyBooks, limit: usize) -> String {
     let mut names: Vec<String> = asset_ids
         .iter()
-        .map(|id| match books.get(id) {
+        .map(|id| match books.unit(id) {
             Some(book) => book.label.clone(),
             // Not in the routing map: can't happen (we subscribe to its keys), so show the raw id.
             None => format!("<unknown token {id}>"),
@@ -553,7 +749,7 @@ async fn idle_watch(last_data_at: &AtomicU64, timeout: Duration) {
 
 async fn read_loop<S>(
     read: &mut S,
-    books: &HashMap<String, PolyTokenBook>,
+    books: &PolyBooks,
     pending: &Mutex<HashSet<String>>,
     last_data_at: &AtomicU64,
     conn: &str,
@@ -599,7 +795,7 @@ where
 /// of events; non-JSON frames (e.g. a bare "PONG") are ignored.
 async fn handle_message(
     text: &str,
-    books: &HashMap<String, PolyTokenBook>,
+    books: &PolyBooks,
     pending: &Mutex<HashSet<String>>,
 ) -> Result<()> {
     let value: Value = match serde_json::from_str(text) {
@@ -620,7 +816,7 @@ async fn handle_message(
 
 async fn handle_event(
     event: &Value,
-    books: &HashMap<String, PolyTokenBook>,
+    books: &PolyBooks,
     pending: &Mutex<HashSet<String>>,
 ) -> Result<()> {
     match event["event_type"].as_str() {
@@ -640,9 +836,11 @@ async fn handle_event(
 }
 
 /// Full book snapshot for one asset: replace both sides.
-async fn apply_book_snapshot(book: &Value, books: &HashMap<String, PolyTokenBook>) -> Result<()> {
+async fn apply_book_snapshot(book: &Value, books: &PolyBooks) -> Result<()> {
     let asset_id = book["asset_id"].as_str().unwrap_or("");
-    let Some(token) = books.get(asset_id) else {
+    // `routed`, so a frame still in flight for a token the fleet has just unsubscribed is dropped
+    // rather than re-populating a book that was deliberately blanked (§4.3).
+    let Some(token) = books.routed(asset_id) else {
         return Ok(());
     };
 
@@ -661,7 +859,7 @@ async fn apply_book_snapshot(book: &Value, books: &HashMap<String, PolyTokenBook
 /// Incremental price/size updates. Handles both observed Polymarket shapes:
 ///   { "price_changes": [ { asset_id, price, size, side }, ... ] }
 ///   { "asset_id": "..", "changes": [ { price, size, side }, ... ] }
-async fn apply_price_change(event: &Value, books: &HashMap<String, PolyTokenBook>) -> Result<()> {
+async fn apply_price_change(event: &Value, books: &PolyBooks) -> Result<()> {
     let top_asset = event["asset_id"].as_str();
 
     let changes: Vec<(String, &Value)> = if let Some(arr) = event["price_changes"].as_array() {
@@ -682,7 +880,7 @@ async fn apply_price_change(event: &Value, books: &HashMap<String, PolyTokenBook
     };
 
     for (asset_id, change) in changes {
-        let Some(token) = books.get(&asset_id) else {
+        let Some(token) = books.routed(&asset_id) else {
             continue;
         };
         let price = as_f64_lenient(&change["price"]);
@@ -718,6 +916,17 @@ mod tests {
 
     fn missing_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The routing map as a live connection holds it: everything known **and** subscribed, which
+    /// is the state every one of these tests is asserting behaviour inside.
+    fn live_books<const N: usize>(entries: [(&str, &str); N]) -> PolyBooks {
+        Registry::from_map_active(
+            entries
+                .into_iter()
+                .map(|(id, label)| (id.to_string(), book_with_levels(label)))
+                .collect(),
+        )
     }
 
     fn book_with_levels(label: &str) -> PolyTokenBook {
@@ -859,21 +1068,16 @@ mod tests {
 
     #[tokio::test]
     async fn blanking_clears_quotes_but_not_metadata_or_neighbours() {
-        let books: HashMap<String, PolyTokenBook> = [
-            ("dead".to_string(), book_with_levels("Dead / YES")),
-            ("live".to_string(), book_with_levels("Live / YES")),
-        ]
-        .into_iter()
-        .collect();
+        let books = live_books([("dead", "Dead / YES"), ("live", "Live / YES")]);
 
         blank_books(&ids(&["dead", "not-in-the-map"]), &books).await;
 
-        let dead = &books["dead"];
+        let dead = books.unit("dead").unwrap();
         assert!(dead.bids.lock().await.is_empty(), "no bid survives — nothing quotes it");
         assert!(dead.asks.lock().await.is_empty());
         assert_eq!(*dead.tick_size.lock().await, 0.01, "metadata is not a quote");
 
-        let live = &books["live"];
+        let live = books.unit("live").unwrap();
         assert_eq!(live.bids.lock().await.len(), 1, "an unrelated token is untouched");
         assert_eq!(live.asks.lock().await.len(), 1);
     }
@@ -888,8 +1092,7 @@ mod tests {
     /// asks. That is a crossed book the arb engine would happily price.
     #[tokio::test]
     async fn an_empty_snapshot_clears_a_populated_book() {
-        let books: HashMap<String, PolyTokenBook> =
-            [("t".to_string(), book_with_levels("Market / YES"))].into_iter().collect();
+        let books = live_books([("t", "Market / YES")]);
 
         apply_book_snapshot(
             &json!({ "event_type": "book", "asset_id": "t", "bids": [], "asks": [] }),
@@ -898,23 +1101,66 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(books["t"].bids.lock().await.is_empty(), "the venue said empty");
-        assert!(books["t"].asks.lock().await.is_empty());
-        assert_eq!(*books["t"].tick_size.lock().await, 0.01, "metadata is not a quote");
+        let t = books.unit("t").unwrap();
+        assert!(t.bids.lock().await.is_empty(), "the venue said empty");
+        assert!(t.asks.lock().await.is_empty());
+        assert_eq!(*t.tick_size.lock().await, 0.01, "metadata is not a quote");
     }
 
     /// Same rule when the venue omits the sides entirely instead of sending empty arrays.
     #[tokio::test]
     async fn a_snapshot_omitting_both_sides_clears_the_book() {
-        let books: HashMap<String, PolyTokenBook> =
-            [("t".to_string(), book_with_levels("Market / YES"))].into_iter().collect();
+        let books = live_books([("t", "Market / YES")]);
 
         apply_book_snapshot(&json!({ "event_type": "book", "asset_id": "t" }), &books)
             .await
             .unwrap();
 
-        assert!(books["t"].bids.lock().await.is_empty());
-        assert!(books["t"].asks.lock().await.is_empty());
+        let t = books.unit("t").unwrap();
+        assert!(t.bids.lock().await.is_empty());
+        assert!(t.asks.lock().await.is_empty());
+    }
+
+    /// **§4.3's half of the unsubscribe.** The reconnect that actually withdraws the subscription
+    /// is seconds away, so the venue is still streaming a token the fleet has just dropped. Those
+    /// frames must not land: the book was blanked on the way out, and re-populating it would put
+    /// levels nobody is maintaining back in front of the arb engine.
+    #[tokio::test]
+    async fn a_frame_for_an_unsubscribed_token_is_dropped() {
+        let books = live_books([("t", "Market / YES")]);
+        books.deactivate(&ids(&["t"]));
+        blank_books(&ids(&["t"]), &books).await;
+
+        apply_book_snapshot(
+            &json!({
+                "event_type": "book",
+                "asset_id": "t",
+                "bids": [{ "price": "0.40", "size": "100" }],
+                "asks": [{ "price": "0.60", "size": "100" }],
+            }),
+            &books,
+        )
+        .await
+        .unwrap();
+
+        let t = books.unit("t").unwrap();
+        assert!(t.bids.lock().await.is_empty(), "routing stopped at the deactivate");
+        assert!(t.asks.lock().await.is_empty());
+
+        // …and it comes straight back the moment the unit is subscribed again.
+        books.activate(&ids(&["t"]));
+        apply_book_snapshot(
+            &json!({
+                "event_type": "book",
+                "asset_id": "t",
+                "bids": [{ "price": "0.40", "size": "100" }],
+                "asks": [],
+            }),
+            &books,
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.bids.lock().await.len(), 1);
     }
 
     /// A blank snapshot still counts as delivered: the subscription demonstrably works, so the
@@ -922,8 +1168,7 @@ mod tests {
     /// confirmed-empty book are different signals and must not collapse into one.
     #[tokio::test]
     async fn a_blank_snapshot_still_clears_the_watchdog() {
-        let books: HashMap<String, PolyTokenBook> =
-            [("t".to_string(), book_with_levels("Market / YES"))].into_iter().collect();
+        let books = live_books([("t", "Market / YES")]);
         let pending: Mutex<HashSet<String>> = Mutex::new(missing_set(&["t"]));
 
         handle_event(
@@ -937,13 +1182,79 @@ mod tests {
         assert!(pending.lock().await.is_empty(), "it answered, so it is not silent");
     }
 
+    // -- §4.2 / §4.3: the assignment a chunk connection works from ---------------------------
+
+    fn assign(live: &[&str], assigned: &[&str]) -> (Vec<String>, HashSet<String>, HashMap<String, u32>) {
+        let mut pruned = HashSet::new();
+        let mut strikes = HashMap::new();
+        let next = apply_assignment(&ids(live), &ids(assigned), &mut pruned, &mut strikes);
+        (next, pruned, strikes)
+    }
+
+    #[test]
+    fn a_new_assignment_adds_and_drops_and_keeps_the_rest() {
+        let (next, _, _) = assign(&["a", "b"], &["b", "c"]);
+        assert_eq!(next, ids(&["b", "c"]), "a left, c joined, b stayed put");
+    }
+
+    /// A token leaving this connection takes its strike count with it. A count that outlived the
+    /// assignment would follow the token back on a later re-subscribe and prune it early.
+    #[test]
+    fn a_departing_token_takes_its_strikes_with_it() {
+        let mut pruned = HashSet::new();
+        let mut strikes: HashMap<String, u32> = [("a".to_string(), 3), ("b".to_string(), 1)]
+            .into_iter()
+            .collect();
+        let next = apply_assignment(&ids(&["a", "b"]), &ids(&["b"]), &mut pruned, &mut strikes);
+
+        assert_eq!(next, ids(&["b"]));
+        assert!(strikes.get("a").is_none(), "gone with the token");
+        assert_eq!(strikes.get("b"), Some(&1), "and the one that stayed keeps its count");
+    }
+
+    /// **The prune must survive a universe change.** A market added anywhere on this chunk re-sends
+    /// the whole assignment, which still names the pruned token — re-reading it naively would undo
+    /// every prune on the connection and hand a dead token back to a healthy shard.
+    #[test]
+    fn a_pruned_token_is_not_handed_back_by_a_re_read() {
+        let mut pruned: HashSet<String> = ["dead".to_string()].into_iter().collect();
+        let mut strikes = HashMap::new();
+        let next = apply_assignment(
+            &ids(&["alive"]),
+            &ids(&["alive", "dead", "new"]),
+            &mut pruned,
+            &mut strikes,
+        );
+        assert_eq!(next, ids(&["alive", "new"]), "the newcomer joins; the pruned one does not");
+        assert!(pruned.contains("dead"), "it is still rehab's to return, not this chunk's");
+    }
+
+    /// …but once the fleet stops wanting it, the prune record goes too: a token subscribed afresh
+    /// later deserves a clean slate rather than an instant re-prune.
+    #[test]
+    fn unsubscribing_a_pruned_token_clears_its_record() {
+        let mut pruned: HashSet<String> = ["dead".to_string()].into_iter().collect();
+        let mut strikes = HashMap::new();
+        apply_assignment(&ids(&["alive"]), &ids(&["alive"]), &mut pruned, &mut strikes);
+        assert!(pruned.is_empty());
+    }
+
+    /// A token the fleet drops while it is parked must not come back out of rehab an hour later.
+    #[tokio::test]
+    async fn forgetting_a_parked_token_cancels_its_rehab() {
+        let pool = RehabPool::new();
+        let old = now_ms() - REHAB_DELAY.as_millis() as u64 - 1;
+        pool.park_at(&ids(&["gone", "kept"]), old).await;
+
+        pool.forget(&ids(&["gone"])).await;
+        assert_eq!(pool.take_due(REHAB_DELAY, CHUNK_SIZE).await, ids(&["kept"]));
+        assert_eq!(pool.len().await, 0);
+    }
+
     /// The prune log gets every name; the reconnect chatter gets a capped sample plus a count.
     #[test]
     fn describe_assets_caps_only_when_asked_to() {
-        let books: HashMap<String, PolyTokenBook> = ["c", "a", "b"]
-            .iter()
-            .map(|id| (id.to_string(), book_with_levels(&format!("Market {id}"))))
-            .collect();
+        let books = live_books([("a", "Market a"), ("b", "Market b"), ("c", "Market c")]);
         let all = ids(&["a", "b", "c"]);
 
         assert_eq!(

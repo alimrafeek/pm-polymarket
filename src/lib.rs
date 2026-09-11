@@ -12,4 +12,4 @@ pub use trade::{PolyApiCreds, PolyOrderAck, PolyOrderType, PolyTrader};
 pub use types::{
     PolyTokenBook, PolymarketFeeSchedule, PolymarketMarketDetails, DEFAULT_MIN_ORDER_SIZE,
 };
-pub use ws::run_poly_ws;
+pub use ws::{run_poly_ws, PolyBooks};
