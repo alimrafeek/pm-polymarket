@@ -231,8 +231,10 @@ const POSITIONS_PAGE_LIMIT: usize = 500;
 /// is handed a full `MAX_PAIRS_PER_TRADE` of fresh capacity on top of inventory it already holds
 /// — and its real holdings are never offered for exit. Positions below `sizeThreshold` (1 share)
 /// are still dropped by the venue, which is dust against a 40-pair cap.
-pub async fn get_poly_positions() -> Result<Vec<(String, f64, f64)>> {
-    fetch_poly_position_rows()
+pub async fn get_poly_positions(
+    trader: &crate::trade::PolyTrader,
+) -> Result<Vec<(String, f64, f64)>> {
+    fetch_poly_position_rows(trader)
         .await?
         .iter()
         .map(|position| {
@@ -253,33 +255,38 @@ pub async fn get_poly_positions() -> Result<Vec<(String, f64, f64)>> {
         .collect()
 }
 
-/// Every `GET /positions` row for `POLY_FUNDER`, untouched. Shared by [`get_poly_positions`] and
-/// [`get_poly_portfolio`] so the paging loop — and the de-duplication that makes an ignored
-/// `offset` terminate — exists once rather than once per reader.
-async fn fetch_poly_position_rows() -> Result<Vec<Value>> {
-    let user = venue_core::trade::required_env("POLY_FUNDER")?;
-    let client = reqwest::Client::new();
-
+/// Every `GET /positions` row for this trader's deposit wallet, untouched. Shared by
+/// [`get_poly_positions`] and [`get_poly_portfolio`] so the paging loop — and the de-duplication
+/// that makes an ignored `offset` terminate — exists once rather than once per reader.
+///
+/// **The wallet is not named here, and cannot be.** This asks for `/positions` and the credential
+/// holder appends `?user=<funder>` ([`crate::trade::PolyL2Auth::url`]), so a gateway-backed engine
+/// is asking about its own account by construction. Until 2026-09-18 this built the whole URL
+/// itself from `POLY_FUNDER` in the process environment and sent it on a private `reqwest` client —
+/// which is why the engine still had to be handed a wallet address, and why this one read sat
+/// outside the fleet rate budget that every other venue call goes through.
+async fn fetch_poly_position_rows(trader: &crate::trade::PolyTrader) -> Result<Vec<Value>> {
     let mut result: Vec<Value> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut offset: usize = 0;
     loop {
-        let url = format!(
-            "https://data-api.polymarket.com/positions?sizeThreshold=1&limit={POSITIONS_PAGE_LIMIT}&offset={offset}&sortBy=TOKENS&sortDirection=DESC&user={user}"
+        let path = format!(
+            "/positions?sizeThreshold=1&limit={POSITIONS_PAGE_LIMIT}&offset={offset}&sortBy=TOKENS&sortDirection=DESC"
         );
 
-        let response = client
-            .get(&url)
-            .header("accept", "application/json")
-            .send()
-            .await?;
+        let response = trader.data_get(&path).await?;
 
-        if !response.status().is_success() {
-            println!("[{}] : Failed to fetch positions for user '{}'. Status: {}", get_timestamp_ist(), user, response.status());
-            return Err(anyhow!("Request failed with status: {}", response.status()));
+        if !(200..300).contains(&response.status) {
+            let msg = format!(
+                "GET {path} failed: HTTP {}: {}",
+                response.status, response.body,
+            );
+            println!("[{}] : {msg}", get_timestamp_ist());
+            return Err(anyhow!(msg));
         }
 
-        let json_response: Value = response.json().await?;
+        let json_response: Value = serde_json::from_str(&response.body)
+            .with_context(|| format!("parsing the positions page at offset {offset}"))?;
 
         let positions = json_response
             .as_array()
@@ -380,7 +387,7 @@ async fn get_poly_balance_once(trader: &crate::trade::PolyTrader) -> Result<f64>
 /// bot on a drawdown.
 pub async fn get_poly_portfolio(trader: &crate::trade::PolyTrader) -> Result<PortfolioValue> {
     let cash = get_poly_balance(trader).await?;
-    let positions = marked_total(&get_poly_marked_positions().await?);
+    let positions = marked_total(&get_poly_marked_positions(trader).await?);
     Ok(PortfolioValue { cash, positions })
 }
 
@@ -396,13 +403,15 @@ pub async fn get_poly_portfolio(trader: &crate::trade::PolyTrader) -> Result<Por
 ///
 /// Retried on the balance budget rather than the market-read one, for the same reason: this is off
 /// the quoting path, and riding out a minutes-long data-API wobble beats failing a breaker check.
-pub async fn get_poly_marked_positions() -> Result<Vec<MarkedPosition>> {
+pub async fn get_poly_marked_positions(
+    trader: &crate::trade::PolyTrader,
+) -> Result<Vec<MarkedPosition>> {
     const MAX_ATTEMPTS: u32 = 5;
     const RETRY_DELAY_SEC: u64 = 15;
 
     let mut last_err = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match get_poly_marked_positions_once().await {
+        match get_poly_marked_positions_once(trader).await {
             Ok(positions) => return Ok(positions),
             Err(e) => {
                 log_event(
@@ -428,8 +437,10 @@ pub async fn get_poly_marked_positions() -> Result<Vec<MarkedPosition>> {
     Err(last_err.unwrap())
 }
 
-async fn get_poly_marked_positions_once() -> Result<Vec<MarkedPosition>> {
-    fetch_poly_position_rows()
+async fn get_poly_marked_positions_once(
+    trader: &crate::trade::PolyTrader,
+) -> Result<Vec<MarkedPosition>> {
+    fetch_poly_position_rows(trader)
         .await?
         .iter()
         .map(parse_marked_position)

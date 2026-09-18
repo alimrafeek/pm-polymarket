@@ -55,6 +55,20 @@ use venue_core::transport::{
 };
 
 pub(crate) const HOST: &str = "https://clob.polymarket.com";
+
+/// Polymarket's second host. It serves exactly one thing this bot wants — `/positions`, the
+/// mark-to-market rows the drawdown breaker values the account from — and it is **unauthenticated**,
+/// keyed on `?user=<wallet>` rather than on a credential.
+pub(crate) const DATA_HOST: &str = "https://data-api.polymarket.com";
+
+/// Routing marker for [`DATA_HOST`]. Not a path segment the venue ever sees: [`PolyL2Auth::url`]
+/// strips it, swaps the host and appends the wallet.
+///
+/// A prefix rather than a second `VenueKind` or a field on `VenueRequest` because the whole point is
+/// that nothing above the credential holder has to know this host exists — `rest.rs` asks for
+/// `/data-api/positions`, the gateway allowlists that string, and the wallet is filled in at the one
+/// place that is entitled to know it.
+pub(crate) const DATA_API_PREFIX: &str = "/data-api";
 const CHAIN_ID: u64 = 137; // Polygon
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
 const ORDER_VERSION: &str = "2";
@@ -292,6 +306,11 @@ pub struct PolyL2Auth {
     api_key: Uuid,
     api_secret_b64url: String,
     passphrase: String,
+    /// The deposit wallet, for the one read that is keyed on it rather than signed —
+    /// [`Self::url`]. Not a secret (it is public on-chain) and not a credential, but it lives here
+    /// for the same reason `maker` lives on the signer: **the holder decides whose account a
+    /// request is about**, so that a caller without one cannot name a wallet at all.
+    funder: Address,
 }
 
 // Opaque on purpose: this struct *is* the credential.
@@ -302,8 +321,29 @@ impl fmt::Debug for PolyL2Auth {
 }
 
 impl RequestAuth for PolyL2Auth {
+    /// The CLOB for everything, **except** the one Polymarket read that lives on a different host.
+    ///
+    /// `DATA_API_PREFIX` is a routing marker, not a real path segment: it is stripped here and the
+    /// request goes to [`DATA_HOST`] instead of [`HOST`]. Two things make the indirection worth it.
+    ///
+    /// The first is *who knows the wallet*. `data-api.polymarket.com/positions` is keyed on
+    /// `?user=<address>`, and the address is the deposit wallet — so a caller that could name it
+    /// could ask about somebody else's account. It is appended **here**, from this credential's own
+    /// `funder`, exactly the way `maker` and `signer` are filled in on an order the engine has no
+    /// way to express (§2.3). A credential-free engine therefore asks for "my positions" and cannot
+    /// ask for anyone else's; there is nowhere in the request to put a wallet.
+    ///
+    /// The second is that it keeps the call on the transport at all, which is what puts it inside
+    /// the gateway's fleet rate budget. Before this it was a bare `reqwest` GET straight from the
+    /// engine, outside every limiter — harmless at one tenant and not at twenty.
     fn url(&self, path: &str) -> String {
-        format!("{HOST}{path}")
+        match path.strip_prefix(DATA_API_PREFIX) {
+            Some(rest) => {
+                let sep = if rest.contains('?') { '&' } else { '?' };
+                format!("{DATA_HOST}{rest}{sep}user={}", self.funder)
+            }
+            None => format!("{HOST}{path}"),
+        }
     }
 
     /// Polymarket L2 auth: HMAC-SHA256 over `{timestamp}{method}{path}{body}` with the base64url
@@ -314,7 +354,17 @@ impl RequestAuth for PolyL2Auth {
     ///
     /// **The signed `path` excludes the query string**, matching the official clients and every
     /// existing call site: `/balance-allowance?asset_type=…` signs `/balance-allowance`.
+    ///
+    /// **[`DATA_API_PREFIX`] requests carry no headers at all, and that is deliberate.** The data
+    /// API is unauthenticated — it answers on the wallet in the query string and looks at nothing
+    /// else — so signing would buy nothing, and the headers are not inert: they carry the L2 api
+    /// key, the passphrase and a valid HMAC. Sending those to a host that never asked for them
+    /// hands a working credential to a second origin for no reason. An empty vec is the whole
+    /// mitigation.
     fn headers(&self, method: &str, path: &str, body: &str) -> Result<Vec<(String, String)>> {
+        if path.starts_with(DATA_API_PREFIX) {
+            return Ok(Vec::new());
+        }
         let signed_path = path.split('?').next().unwrap_or(path);
         let timestamp = now_ts();
         let decoded = URL_SAFE
@@ -416,7 +466,7 @@ impl PolyTrader {
         let http = venue_http_builder().default_headers(default_headers).build()?;
 
         let auth =
-            Arc::new(PolyL2Auth { eoa, api_key, api_secret_b64url, passphrase });
+            Arc::new(PolyL2Auth { eoa, api_key, api_secret_b64url, passphrase, funder });
         Ok(Self {
             transport: Arc::new(Direct::new(http.clone(), auth)),
             signer: Some(PolySigner { signing_key, eoa, api_key, funder, http }),
@@ -459,6 +509,25 @@ impl PolyTrader {
                 Intent::Read,
                 "GET",
                 path_and_query,
+                None,
+            ))
+            .await
+    }
+
+    /// One **unauthenticated** read on Polymarket's data API, through whichever transport this
+    /// trader has — [`DATA_API_PREFIX`], stripped and re-hosted by [`PolyL2Auth::url`].
+    ///
+    /// `path_and_query` must **not** carry a `user=` parameter, and cannot meaningfully: the wallet
+    /// is appended by the credential holder, so a gateway-mode caller is asking about its own
+    /// account by construction and has no way to ask about another. [`Intent::Read`] — it spends the
+    /// ordinary half of the fleet budget, like every other read.
+    pub(crate) async fn data_get(&self, path_and_query: &str) -> Result<VenueResponse> {
+        self.transport
+            .send(VenueRequest::http(
+                VenueKind::Poly,
+                Intent::Read,
+                "GET",
+                format!("{DATA_API_PREFIX}{path_and_query}").as_str(),
                 None,
             ))
             .await
@@ -1495,6 +1564,75 @@ mod tests {
         assert_eq!(v["orderType"], "GTD");
         assert_eq!(v["postOnly"], true);
         assert_eq!(v["order"]["expiration"], (1_800_000_000u64 + 60 + 600).to_string());
+    }
+
+    /// An auth with a known wallet, for the routing tests below. The secret material is nonsense on
+    /// purpose — none of it is exercised on the data-API path, which is the point.
+    fn data_auth() -> PolyL2Auth {
+        PolyL2Auth {
+            eoa: Address::from_str("0x000000000000000000000000000000000000dEaD").expect("eoa"),
+            api_key: Uuid::nil(),
+            api_secret_b64url: URL_SAFE.encode(b"not-a-real-secret"),
+            passphrase: "pass".to_string(),
+            funder: Address::from_str("0x00000000000000000000000000000000cafeBabe")
+                .expect("funder"),
+        }
+    }
+
+    /// **The wallet is appended by the credential holder and by nobody else.**
+    ///
+    /// This is what lets a credential-free engine ask for "my positions": it sends
+    /// `/data-api/positions?…` with no wallet in it, and the holder decides whose account that
+    /// means. An engine cannot name a different one because there is nowhere in the request to put
+    /// it — the same property `maker`/`signer` have on an order.
+    #[test]
+    fn the_data_api_path_is_rehosted_and_carries_the_funder() {
+        let auth = data_auth();
+        let url = auth.url("/data-api/positions?sizeThreshold=1&limit=500");
+        assert!(url.starts_with(DATA_HOST), "must leave the CLOB: {url}");
+        assert!(!url.contains(HOST), "must not be sent to the CLOB: {url}");
+        assert!(url.contains("/positions?sizeThreshold=1&limit=500"), "{url}");
+        // Case-insensitively, because `Address`'s `Display` lowercases while the operator's old
+        // `.env` string was usually EIP-55 checksummed. **That difference is safe and was measured,
+        // not assumed** (2026-09-18, live): the same wallet queried checksummed, all-lower and
+        // all-upper returned the identical 13 rows, so the data API folds case. Worth having
+        // checked — a string-matching API would have returned zero rows, which reads as "no
+        // positions" and would quietly under-value the account the drawdown breaker measures.
+        assert!(
+            url.to_lowercase().ends_with("&user=0x00000000000000000000000000000000cafebabe"),
+            "{url}",
+        );
+
+        // A path with no query of its own still gets a well-formed one.
+        let bare = auth.url("/data-api/positions").to_lowercase();
+        assert!(bare.ends_with("/positions?user=0x00000000000000000000000000000000cafebabe"), "{bare}");
+    }
+
+    /// Every other path is untouched, so adding the second host cannot have moved an existing call.
+    #[test]
+    fn every_other_path_still_goes_to_the_clob() {
+        let auth = data_auth();
+        for path in ["/order", "/balance-allowance?asset_type=COLLATERAL", "/data/orders", "/data/trades"] {
+            let url = auth.url(path);
+            assert_eq!(url, format!("{HOST}{path}"), "{path} must stay on the CLOB");
+            assert!(!url.contains("user="), "{path} must not be given a wallet");
+        }
+    }
+
+    /// **No credential is sent to the data API.** It is unauthenticated, so the L2 headers would buy
+    /// nothing — and they are not inert: they carry the api key, the passphrase and a live HMAC.
+    /// Handing those to a second origin for no reason is the thing this prevents.
+    #[test]
+    fn the_data_api_request_carries_no_credential() {
+        let auth = data_auth();
+        let headers = auth.headers("GET", "/data-api/positions?limit=500", "").expect("headers");
+        assert!(headers.is_empty(), "the data API must be sent no headers at all: {headers:?}");
+
+        // …while a CLOB read still signs, so the suppression is scoped and not a hole.
+        let signed = auth.headers("GET", "/balance-allowance", "").expect("headers");
+        let names: Vec<&str> = signed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&POLY_API_KEY), "{names:?}");
+        assert!(names.contains(&POLY_SIGNATURE), "{names:?}");
     }
 
     /// Ack amounts arrive as plain-decimal strings (a live BUY capture; see
