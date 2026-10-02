@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
+use venue_core::book::BookStamp;
 use venue_core::book::OrderBookLevel;
 
 /// Taker fee schedule from the Gamma market-level `feeSchedule`. Fee rates vary per market
@@ -79,4 +80,7 @@ pub struct PolyTokenBook {
     pub tick_size: Arc<Mutex<f64>>,
     /// This market's change notifier; the WS handler fires it after applying an update.
     pub change: Arc<Notify>,
+    /// Where this token's current book came from (LATENCY_TRACE_SPEC). Written by the WS handler
+    /// with every update it applies; read by whoever publishes the book.
+    pub stamp: Arc<BookStamp>,
 }

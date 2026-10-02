@@ -12,7 +12,9 @@ use tungstenite::{client::IntoClientRequest, Message};
 use url::Url;
 
 use crate::types::PolyTokenBook;
-use venue_core::book::{as_f64_lenient, now_ms, parse_levels, sort_levels, upsert_level, ws_debug};
+use venue_core::book::{
+    as_f64_lenient, now_ms, now_us, parse_levels, sort_levels, upsert_level, ws_debug, FeedStamp,
+};
 use venue_core::log::{get_timestamp_ist, log_event};
 use venue_core::universe::{
     net_change, next_batch, ChunkMap, NetChange, Registry, UnitDelta, DEBOUNCE_MAX, DEBOUNCE_QUIET,
@@ -761,21 +763,23 @@ where
         let msg = msg?;
         match msg {
             Message::Text(t) => {
+                let recv_us = now_us();
                 last_data_at.store(now_ms(), Ordering::Relaxed);
                 if ws_debug() {
                     println!("[{}] : [poly-ws#{conn}] RECV: {t}", get_timestamp_ist());
                 }
-                if let Err(e) = handle_message(&t, books, pending).await {
+                if let Err(e) = handle_message(&t, books, pending, recv_us).await {
                     eprintln!("[{}] : [poly-ws#{conn}] handle error: {e}", get_timestamp_ist());
                 }
             }
             Message::Binary(b) => {
+                let recv_us = now_us();
                 last_data_at.store(now_ms(), Ordering::Relaxed);
                 if let Ok(s) = String::from_utf8(b) {
                     if ws_debug() {
                         println!("[{}] : [poly-ws#{conn}] RECV BINARY: {s}", get_timestamp_ist());
                     }
-                    if let Err(e) = handle_message(&s, books, pending).await {
+                    if let Err(e) = handle_message(&s, books, pending, recv_us).await {
                         eprintln!("[{}] : [poly-ws#{conn}] handle error: {e}", get_timestamp_ist());
                     }
                 }
@@ -797,6 +801,7 @@ async fn handle_message(
     text: &str,
     books: &PolyBooks,
     pending: &Mutex<HashSet<String>>,
+    recv_us: u64,
 ) -> Result<()> {
     let value: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -806,10 +811,10 @@ async fn handle_message(
     match value {
         Value::Array(items) => {
             for item in &items {
-                handle_event(item, books, pending).await?;
+                handle_event(item, books, pending, recv_us).await?;
             }
         }
-        obj => handle_event(&obj, books, pending).await?,
+        obj => handle_event(&obj, books, pending, recv_us).await?,
     }
     Ok(())
 }
@@ -818,10 +823,11 @@ async fn handle_event(
     event: &Value,
     books: &PolyBooks,
     pending: &Mutex<HashSet<String>>,
+    recv_us: u64,
 ) -> Result<()> {
     match event["event_type"].as_str() {
         Some("book") => {
-            let result = apply_book_snapshot(event, books).await;
+            let result = apply_book_snapshot(event, books, recv_us).await;
             // This asset has delivered its initial snapshot, so the watchdog no longer waits on
             // it. Removing an already-removed id (later re-snapshots) is a harmless no-op.
             if let Some(asset_id) = event["asset_id"].as_str() {
@@ -829,14 +835,24 @@ async fn handle_event(
             }
             result
         }
-        Some("price_change") => apply_price_change(event, books).await,
+        Some("price_change") => apply_price_change(event, books, recv_us).await,
         // tick_size_change / last_trade_price / etc. are not needed for book maintenance.
         _ => Ok(()),
     }
 }
 
+/// The venue's own timestamp on a market-channel event: `timestamp`, epoch milliseconds, sent as
+/// a string (a number is accepted too). 0 when absent or unparseable.
+fn event_ms(event: &Value) -> u64 {
+    match &event["timestamp"] {
+        Value::String(s) => s.parse::<u64>().unwrap_or(0),
+        Value::Number(n) => n.as_u64().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// Full book snapshot for one asset: replace both sides.
-async fn apply_book_snapshot(book: &Value, books: &PolyBooks) -> Result<()> {
+async fn apply_book_snapshot(book: &Value, books: &PolyBooks, recv_us: u64) -> Result<()> {
     let asset_id = book["asset_id"].as_str().unwrap_or("");
     // `routed`, so a frame still in flight for a token the fleet has just unsubscribed is dropped
     // rather than re-populating a book that was deliberately blanked (§4.3).
@@ -852,6 +868,7 @@ async fn apply_book_snapshot(book: &Value, books: &PolyBooks) -> Result<()> {
     }
 
     sort_levels(&token.bids, &token.asks).await;
+    token.stamp.set(FeedStamp { venue_ms: event_ms(book), recv_us });
     token.change.notify_one();
     Ok(())
 }
@@ -859,7 +876,8 @@ async fn apply_book_snapshot(book: &Value, books: &PolyBooks) -> Result<()> {
 /// Incremental price/size updates. Handles both observed Polymarket shapes:
 ///   { "price_changes": [ { asset_id, price, size, side }, ... ] }
 ///   { "asset_id": "..", "changes": [ { price, size, side }, ... ] }
-async fn apply_price_change(event: &Value, books: &PolyBooks) -> Result<()> {
+async fn apply_price_change(event: &Value, books: &PolyBooks, recv_us: u64) -> Result<()> {
+    let venue_ms = event_ms(event);
     let top_asset = event["asset_id"].as_str();
 
     let changes: Vec<(String, &Value)> = if let Some(arr) = event["price_changes"].as_array() {
@@ -898,6 +916,7 @@ async fn apply_price_change(event: &Value, books: &PolyBooks) -> Result<()> {
         }
 
         sort_levels(&token.bids, &token.asks).await;
+        token.stamp.set(FeedStamp { venue_ms, recv_us });
         token.change.notify_one();
     }
 
@@ -936,7 +955,39 @@ mod tests {
             asks: Arc::new(Mutex::new(vec![OrderBookLevel { price: 0.60, size: 100.0 }])),
             tick_size: Arc::new(Mutex::new(0.01)),
             change: Arc::new(Notify::new()),
+            stamp: Arc::default(),
         }
+    }
+
+    #[test]
+    fn event_ms_reads_the_string_and_the_number() {
+        assert_eq!(event_ms(&json!({ "timestamp": "1757908892351" })), 1757908892351);
+        assert_eq!(event_ms(&json!({ "timestamp": 1234 })), 1234);
+        assert_eq!(event_ms(&json!({})), 0);
+        assert_eq!(event_ms(&json!({ "timestamp": "x" })), 0);
+    }
+
+    #[tokio::test]
+    async fn a_price_change_stamps_the_book_it_moved() {
+        let books = live_books([("a", "Market / YES"), ("b", "Market / NO")]);
+
+        apply_price_change(
+            &json!({
+                "event_type": "price_change",
+                "timestamp": "1700000000000",
+                "price_changes": [{ "asset_id": "a", "price": "0.41", "size": "50", "side": "BUY" }],
+            }),
+            &books,
+            42,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            books.unit("a").unwrap().stamp.get(),
+            FeedStamp { venue_ms: 1700000000000, recv_us: 42 }
+        );
+        assert_eq!(books.unit("b").unwrap().stamp.get(), FeedStamp::default());
     }
 
     #[test]
@@ -1097,6 +1148,7 @@ mod tests {
         apply_book_snapshot(
             &json!({ "event_type": "book", "asset_id": "t", "bids": [], "asks": [] }),
             &books,
+            0,
         )
         .await
         .unwrap();
@@ -1112,7 +1164,7 @@ mod tests {
     async fn a_snapshot_omitting_both_sides_clears_the_book() {
         let books = live_books([("t", "Market / YES")]);
 
-        apply_book_snapshot(&json!({ "event_type": "book", "asset_id": "t" }), &books)
+        apply_book_snapshot(&json!({ "event_type": "book", "asset_id": "t" }), &books, 0)
             .await
             .unwrap();
 
@@ -1139,6 +1191,7 @@ mod tests {
                 "asks": [{ "price": "0.60", "size": "100" }],
             }),
             &books,
+            0,
         )
         .await
         .unwrap();
@@ -1157,6 +1210,7 @@ mod tests {
                 "asks": [],
             }),
             &books,
+            0,
         )
         .await
         .unwrap();
@@ -1175,6 +1229,7 @@ mod tests {
             &json!({ "event_type": "book", "asset_id": "t", "bids": [], "asks": [] }),
             &books,
             &pending,
+            0,
         )
         .await
         .unwrap();
