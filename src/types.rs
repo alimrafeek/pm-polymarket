@@ -36,6 +36,12 @@ pub struct PolymarketMarketDetails {
     #[allow(dead_code)]
     pub market_id: u64,
     pub market_slug: String,
+    /// The market's own address slug, Gamma's market-level `slug`
+    /// (`will-andy-beshear-win-the-2028-democratic-presidential-nomination-832`): its page is
+    /// `polymarket.com/event/<event slug>/<url_slug>`. `None` on a one-market event, whose event page
+    /// is the market's, and when Gamma leaves it out. Not `market_slug`, which is the outcome's name
+    /// on a multi-market event. Only the alert notifier reads it, for its links.
+    pub url_slug: Option<String>,
     /// Scheduled market resolution time as Unix epoch seconds, parsed from the market-level
     /// `endDate` (UTC). Uses the per-market value, not the event-level `endDate`, which can be years
     /// off. Directly comparable with `OpinionMarketDetails::resolution_time`. 0 if unavailable.

@@ -56,8 +56,9 @@ pub fn iso8601_to_epoch(s: &str) -> Option<i64> {
 /// Market-level fields kept by the Gamma event filter (everything else is dropped by
 /// `pick_fields` before `parse_market_detail` runs). `feeSchedule` must stay in this list: it is
 /// the only place the per-market taker-fee curve exists — `feesEnabled`/`feeType` alone carry no
-/// rate, and dropping it silently zeroes the Polymarket fee leg in the arbitrage edge math.
-const MARKET_FIELDS: [&str; 16] = [
+/// rate, and dropping it silently zeroes the Polymarket fee leg in the arbitrage edge math. `slug`
+/// is the market's own address slug, kept for the alert notifier's links (`url_slug`).
+const MARKET_FIELDS: [&str; 17] = [
     "acceptingOrders",
     "active",
     "archived",
@@ -74,6 +75,7 @@ const MARKET_FIELDS: [&str; 16] = [
     "orderPriceMinTickSize",
     "outcomePrices",
     "outcomes",
+    "slug",
 ];
 
 /// Gamma event lookup for one config slug, wrapped in the venue-standard read retry (3 attempts,
@@ -628,7 +630,8 @@ async fn parse_market_detail(
     for market in markets {
         // What to call this outcome in a skip line. `groupItemTitle` is the outcome name on a
         // multi-market event and is absent on a binary one, where the event slug is the only name
-        // there is — `question`/`slug` are stripped by `pick_fields` long before this runs.
+        // there is — `question` is stripped by `pick_fields` long before this runs, and `slug`,
+        // kept for `url_slug`, is the market's address, not its name.
         let display_name = market
             .get("groupItemTitle")
             .and_then(Value::as_str)
@@ -715,6 +718,15 @@ async fn parse_market_detail(
                 .to_string()
         };
 
+        // The market's own address slug, for links that open the market itself. Not
+        // `market_slug`, which is the outcome's name here. None on a one-market event, whose event
+        // page already is the market's.
+        let url_slug = if is_single_market {
+            None
+        } else {
+            market.get("slug").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
+        };
+
         let clob_token_ids_str = market
             .get("clobTokenIds")
             .and_then(|v| v.as_str())
@@ -786,6 +798,7 @@ async fn parse_market_detail(
         result.push(PolymarketMarketDetails {
             market_id,
             market_slug,
+            url_slug,
             resolution_time,
             neg_risk,
             yes_token_id: clob_token_ids[0].clone(),
@@ -904,6 +917,59 @@ mod tests {
         // rate × p(1−p) × shares, the on-chain-verified taker fee, on the live Spain ask.
         let fee = fs.taker_fee(0.5915, 1.0);
         assert!((fee - 0.05 * 0.5915 * 0.4085).abs() < 1e-12, "got {fee}");
+    }
+
+    /// Links Stage 2: a market's own Gamma `slug` must survive the field filter, and becomes
+    /// `url_slug` on a multi-market event only. `market_slug` is untouched: the outcome's name
+    /// there, the event slug on a one-market event.
+    #[tokio::test]
+    async fn ps1_url_slug_survives_field_filter() {
+        let spain_slug = "will-spain-win-the-2026-fifa-world-cup-963";
+        let brazil_slug = "will-brazil-win-the-2026-fifa-world-cup-412";
+
+        let mut spain = raw_sports_market();
+        spain["slug"] = json!(spain_slug);
+        let spain = pick_fields(&spain, &MARKET_FIELDS);
+        assert_eq!(spain.get("slug"), Some(&json!(spain_slug)), "slug must survive the filter");
+
+        let mut brazil = raw_sports_market();
+        brazil["id"] = json!("553901");
+        brazil["groupItemTitle"] = json!("Brazil");
+        brazil["clobTokenIds"] = json!("[\"333\", \"444\"]");
+        brazil["slug"] = json!(brazil_slug);
+        let brazil = pick_fields(&brazil, &MARKET_FIELDS);
+
+        // Two markets: each keeps its own slug, and each `market_slug` is still its outcome name.
+        let event =
+            json!({ "id": "27799", "slug": "world-cup-winner", "markets": [spain, brazil] });
+        let (details, skipped) = parse_market_detail(event).await.unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].market_slug, "Spain");
+        assert_eq!(details[0].url_slug.as_deref(), Some(spain_slug));
+        assert_eq!(details[1].market_slug, "Brazil");
+        assert_eq!(details[1].url_slug.as_deref(), Some(brazil_slug));
+
+        // Spain alone in its event: the event page is the market's, so no `url_slug`, and
+        // `market_slug` is the event slug as before.
+        let event = json!({ "id": "27799", "slug": "world-cup-winner", "markets": [spain] });
+        let (details, _) = parse_market_detail(event).await.unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].url_slug, None);
+        assert_eq!(details[0].market_slug, "world-cup-winner");
+
+        // Brazil without a `slug` key: it arrives as `null` and gets `None`; Spain keeps hers.
+        let mut brazil = raw_sports_market();
+        brazil["id"] = json!("553901");
+        brazil["groupItemTitle"] = json!("Brazil");
+        brazil["clobTokenIds"] = json!("[\"333\", \"444\"]");
+        let brazil = pick_fields(&brazil, &MARKET_FIELDS);
+        let event =
+            json!({ "id": "27799", "slug": "world-cup-winner", "markets": [spain, brazil] });
+        let (details, _) = parse_market_detail(event).await.unwrap();
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].url_slug.as_deref(), Some(spain_slug));
+        assert_eq!(details[1].url_slug, None);
     }
 
     /// Fee-free markets (feesEnabled false or absent) still parse with no schedule.
