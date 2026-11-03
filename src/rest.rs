@@ -219,19 +219,33 @@ async fn fetch_poly_market_data(
     parse_market_detail(market_data).await
 }
 
-/// Rows per `GET /positions` page. The data API caps a response at 500, so this is one request
-/// for any realistic account and the paging below is insurance rather than a hot path.
-const POSITIONS_PAGE_LIMIT: usize = 500;
+/// Rows per `GET /positions` page: Data API v2's ceiling, so this is one request for any realistic
+/// account and the cursor walk below is insurance rather than a hot path.
+const POSITIONS_PAGE_LIMIT: usize = 1000;
+
+/// Most pages one walk reads before giving up: 50,000 rows at the page cap, far past any real
+/// account. Reaching it is an `Err`, never a silent stop, because a truncated read looks like a
+/// flat account (see [`get_poly_positions`]).
+const POSITIONS_MAX_PAGES: usize = 50;
+
+/// The `status` of each `/positions` pass; `None` leaves the parameter off, which is v2's default.
+///
+/// One pass, from the owner's H-A check against the live wallet (POLY_DATA_V2_SPEC.md §3,
+/// 2026-11-03): the default list already carries resolved-but-unredeemed rows (`REDEEMABLE`),
+/// neither `status=REDEEMABLE` nor `status=REDEEMABLE_LOST` showed a row it did not, and
+/// `include_archived=true` added none. The check matters because a list that dropped 40 unredeemed
+/// winning shares would read the account 40 USDC short, and the drawdown breaker trips on that.
+const POSITIONS_PASSES: [Option<&str>; 1] = [None];
 
 /// Current Polymarket positions for the `POLY_FUNDER` deposit wallet, as
-/// `(token_id, shares, avg_price)` tuples — `asset`, `size`, and `avgPrice` from the
+/// `(token_id, shares, avg_price)` tuples — `token_id`, `current_size`, and `avg_price` from the
 /// data API; everything else in the response is dropped. `avg_price` is the per-share
 /// cost basis used to seed the Polymarket leg's entry price on restart.
 ///
-/// Paged by `offset` until a short page arrives, because a truncated read is not a visibly
+/// Walked by cursor until `next_cursor` is `null`, because a truncated read is not a visibly
 /// degraded one: `seed_positions` treats a token it never saw as flat, and a leg that looks flat
 /// is handed a full `MAX_PAIRS_PER_TRADE` of fresh capacity on top of inventory it already holds
-/// — and its real holdings are never offered for exit. Positions below `sizeThreshold` (1 share)
+/// — and its real holdings are never offered for exit. Positions below `filter_amount` (1 share)
 /// are still dropped by the venue, which is dust against a 40-pair cap.
 pub async fn get_poly_positions(
     trader: &crate::trade::PolyTrader,
@@ -240,26 +254,27 @@ pub async fn get_poly_positions(
         .await?
         .iter()
         .map(|position| {
-            let asset = position
-                .get("asset")
+            let token_id = position
+                .get("token_id")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("position missing asset"))?;
+                .ok_or_else(|| anyhow!("position missing token_id"))?;
             let size = position
-                .get("size")
+                .get("current_size")
                 .and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow!("position missing size"))?;
+                .ok_or_else(|| anyhow!("position missing current_size"))?;
             let avg_price = position
-                .get("avgPrice")
+                .get("avg_price")
                 .and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow!("position missing avgPrice"))?;
-            Ok((asset.to_string(), size, avg_price))
+                .ok_or_else(|| anyhow!("position missing avg_price"))?;
+            Ok((token_id.to_string(), size, avg_price))
         })
         .collect()
 }
 
 /// Every `GET /positions` row for this trader's deposit wallet, untouched. Shared by
-/// [`get_poly_positions`] and [`get_poly_portfolio`] so the paging loop — and the de-duplication
-/// that makes an ignored `offset` terminate — exists once rather than once per reader.
+/// [`get_poly_positions`] and [`get_poly_portfolio`] so the cursor walk — and the de-duplication
+/// and bounds that keep it from spinning or stopping short — exists once rather than once per
+/// reader.
 ///
 /// **The wallet is not named here, and cannot be.** This asks for `/positions` and the credential
 /// holder appends `?user=<funder>` ([`crate::trade::PolyL2Auth::url`]), so a gateway-backed engine
@@ -268,14 +283,7 @@ pub async fn get_poly_positions(
 /// which is why the engine still had to be handed a wallet address, and why this one read sat
 /// outside the fleet rate budget that every other venue call goes through.
 async fn fetch_poly_position_rows(trader: &crate::trade::PolyTrader) -> Result<Vec<Value>> {
-    let mut result: Vec<Value> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut offset: usize = 0;
-    loop {
-        let path = format!(
-            "/positions?sizeThreshold=1&limit={POSITIONS_PAGE_LIMIT}&offset={offset}&sortBy=TOKENS&sortDirection=DESC"
-        );
-
+    walk_position_pages(|path| async move {
         let response = trader.data_get(&path).await?;
 
         if !(200..300).contains(&response.status) {
@@ -286,38 +294,125 @@ async fn fetch_poly_position_rows(trader: &crate::trade::PolyTrader) -> Result<V
             println!("[{}] : {msg}", get_timestamp_ist());
             return Err(anyhow!(msg));
         }
+        Ok(response.body)
+    })
+    .await
+}
 
-        let json_response: Value = serde_json::from_str(&response.body)
-            .with_context(|| format!("parsing the positions page at offset {offset}"))?;
-
-        let positions = json_response
-            .as_array()
-            .ok_or_else(|| anyhow!("Expected positions array in response"))?;
-        let page_len = positions.len();
-
-        let mut added = 0usize;
-        for position in positions {
-            let asset = position
-                .get("asset")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("position missing asset"))?;
-            // One token can only be held once, so a repeat means the venue served a page we have
-            // already read. Keying on the id makes an ignored `offset` a loop that terminates
-            // rather than one that spins forever re-reading page one.
-            if !seen.insert(asset.to_string()) {
-                continue;
+/// The cursor walk behind [`fetch_poly_position_rows`], over any page source so it can be tested
+/// without a network: `fetch` takes a `/positions` path and returns a 2xx body.
+///
+/// Each pass in [`POSITIONS_PASSES`] is read until `pagination.next_cursor` is `null`, and **only**
+/// then: a short or even empty page that still carries a cursor is read on. Say the wallet holds
+/// 1,500 tokens: page one is 1,000 rows and cursor `abc`, page two (the same query plus
+/// `cursor=abc`) is 500 rows and a `null` cursor, and that is the end.
+///
+/// A cursor seen twice, or a walk past [`POSITIONS_MAX_PAGES`], is an `Err`: the first would spin
+/// and the second would end as a silent truncation. Rows are de-duplicated on `token_id` across
+/// pages and passes — one token can only be held once, so a repeat is a row already read, and is
+/// skipped.
+async fn walk_position_pages<F, Fut>(mut fetch: F) -> Result<Vec<Value>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let mut result: Vec<Value> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for status in POSITIONS_PASSES {
+        let mut cursors: HashSet<String> = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            if pages == POSITIONS_MAX_PAGES {
+                return Err(anyhow!(
+                    "positions walk reached {POSITIONS_MAX_PAGES} pages with a cursor still open; \
+                     refusing a truncated read"
+                ));
             }
-            result.push(position.clone());
-            added += 1;
-        }
+            pages += 1;
 
-        // A short page is the last page; a full page that taught us nothing new means `offset`
-        // isn't being honoured, and reading on would not either.
-        if page_len < POSITIONS_PAGE_LIMIT || added == 0 {
-            return Ok(result);
+            let body = fetch(positions_path(status, cursor.as_deref())).await?;
+            let (rows, next_cursor) = parse_positions_page(&body)
+                .with_context(|| format!("parsing positions page {pages}"))?;
+
+            for position in rows {
+                let token_id = position
+                    .get("token_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("position missing token_id"))?
+                    .to_string();
+                if !seen.insert(token_id) {
+                    continue;
+                }
+                result.push(position);
+            }
+
+            match next_cursor {
+                None => break,
+                Some(next) => {
+                    if !cursors.insert(next.clone()) {
+                        return Err(anyhow!(
+                            "positions walk was handed the same cursor twice on page {pages}"
+                        ));
+                    }
+                    cursor = Some(next);
+                }
+            }
         }
-        offset += page_len;
     }
+    Ok(result)
+}
+
+/// The `/positions` path for one page of one pass. Every page repeats the whole query, because the
+/// v2 cursor carries none of it. **Never `offset`, not even `0`:** v2 answers it with HTTP 400. The
+/// cursor is opaque and signed and may hold `+`, `/` or `=`, so it is percent-encoded.
+fn positions_path(status: Option<&str>, cursor: Option<&str>) -> String {
+    let mut path = format!(
+        "/positions?filter_type=TOKENS&filter_amount=1&sort_by=TOKENS&sort_direction=DESC&limit={POSITIONS_PAGE_LIMIT}"
+    );
+    if let Some(status) = status {
+        path.push_str("&status=");
+        path.push_str(status);
+    }
+    if let Some(cursor) = cursor {
+        path.push_str("&cursor=");
+        path.extend(url::form_urlencoded::byte_serialize(cursor.as_bytes()));
+    }
+    path
+}
+
+/// One v2 `/positions` body, `{"data": [...], "pagination": {"next_cursor": ...}}`, as its rows and
+/// its next cursor (`None` on the last page).
+///
+/// A `null` or empty `data` is no positions, the contract's documented miss, not an error. Anything
+/// else that is not a `data` array — or a missing `pagination` object or `next_cursor` — is an
+/// `Err` naming what was missing: a page misread as empty is a flat account.
+fn parse_positions_page(body: &str) -> Result<(Vec<Value>, Option<String>)> {
+    let page: Value = serde_json::from_str(body).context("positions page is not JSON")?;
+    let page = page
+        .as_object()
+        .ok_or_else(|| anyhow!("positions page is not an object"))?;
+    let rows = match page.get("data") {
+        Some(Value::Array(rows)) => rows.clone(),
+        Some(Value::Null) => Vec::new(),
+        Some(_) => return Err(anyhow!("positions page `data` is not an array")),
+        None => return Err(anyhow!("positions page has no `data`")),
+    };
+    let pagination = page
+        .get("pagination")
+        .and_then(|p| p.as_object())
+        .ok_or_else(|| anyhow!("positions page has no `pagination` object"))?;
+    let next_cursor = match pagination.get("next_cursor") {
+        Some(Value::String(cursor)) => Some(cursor.clone()),
+        Some(Value::Null) => None,
+        Some(_) => {
+            return Err(anyhow!(
+                "positions page `pagination.next_cursor` is not a string"
+            ))
+        }
+        None => return Err(anyhow!("positions page has no `pagination.next_cursor`")),
+    };
+    Ok((rows, next_cursor))
 }
 
 /// Available pUSD collateral in the Polymarket deposit wallet, in whole pUSD, from the CLOB's
@@ -395,13 +490,13 @@ pub async fn get_poly_portfolio(trader: &crate::trade::PolyTrader) -> Result<Por
 
 /// Every Polymarket position with the venue's own mark.
 ///
-/// The data API publishes `currentValue` (= `size × curPrice`) on every row, so no book has to be
-/// walked: `curPrice` is Polymarket's mark for the token and `currentValue` is that mark applied
-/// to the exact size held, including its rounding. Verified 2026-09-03 against the live
-/// `POLY_FUNDER` wallet — six rows, `currentValue` and `curPrice` present on every one, and
-/// `currentValue == size × curPrice` to the cent on all six. A resolved loser reports
-/// `currentValue: 0` with `redeemable: true`, which is a correct valuation and not a missing mark;
-/// only an **absent** field is an error.
+/// The data API publishes `current_value` (= `current_size × current_price`) on every row, so no
+/// book has to be walked: `current_price` is Polymarket's mark for the token and `current_value` is
+/// that mark applied to the exact size held, including its rounding. Verified on v1 2026-09-03
+/// against the live `POLY_FUNDER` wallet (six rows, the mark present and `value == size × price` to
+/// the cent on all six), and again on v2 2026-11-03 (66 rows, the same identity on every one). A
+/// resolved loser reports `current_value: 0` with `redeemable: true`, which is a correct valuation
+/// and not a missing mark; only an **absent** field is an error.
 ///
 /// Retried on the balance budget rather than the market-read one, for the same reason: this is off
 /// the quoting path, and riding out a minutes-long data-API wobble beats failing a breaker check.
@@ -450,30 +545,30 @@ async fn get_poly_marked_positions_once(
 }
 
 /// Split out from [`get_poly_marked_positions`] so the wire shape can be tested against captured
-/// JSON. A row missing `currentValue` or `curPrice` is an `Err` — never a zero.
+/// JSON. A row missing `current_value` or `current_price` is an `Err` — never a zero.
 fn parse_marked_position(position: &Value) -> Result<MarkedPosition> {
-    let asset = position
-        .get("asset")
+    let token_id = position
+        .get("token_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("position missing asset"))?;
+        .ok_or_else(|| anyhow!("position missing token_id"))?;
     let shares = position
-        .get("size")
+        .get("current_size")
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| anyhow!("position {asset} missing size"))?;
+        .ok_or_else(|| anyhow!("position {token_id} missing current_size"))?;
     let avg_price = position
-        .get("avgPrice")
+        .get("avg_price")
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| anyhow!("position {asset} missing avgPrice"))?;
+        .ok_or_else(|| anyhow!("position {token_id} missing avg_price"))?;
     let mark = position
-        .get("curPrice")
+        .get("current_price")
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| anyhow!("position {asset} missing curPrice — cannot be marked"))?;
+        .ok_or_else(|| anyhow!("position {token_id} missing current_price — cannot be marked"))?;
     let value = position
-        .get("currentValue")
+        .get("current_value")
         .and_then(|v| v.as_f64())
-        .ok_or_else(|| anyhow!("position {asset} missing currentValue — cannot be marked"))?;
+        .ok_or_else(|| anyhow!("position {token_id} missing current_value — cannot be marked"))?;
     Ok(MarkedPosition {
-        id: asset.to_string(),
+        id: token_id.to_string(),
         shares,
         avg_price,
         mark,
@@ -821,24 +916,56 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Captured live from `GET https://data-api.polymarket.com/positions?...&user=POLY_FUNDER`
-    /// (2026-09-03), trimmed to the fields the mark reads plus a couple that prove the rest is
-    /// ignored. Two rows: an open position, and a resolved loser reporting `currentValue: 0` with
-    /// `redeemable: true`.
-    const POSITIONS_JSON: &str = r#"[
-      {"asset":"21294592205022969346730955103773391901993330222644504059576935265667917187903",
-       "size":40.0,"avgPrice":0.1549,"initialValue":6.196,"currentValue":4.42,"curPrice":0.1105,
-       "redeemable":false,"title":"Will no Fed rate cuts happen in 2026?"},
-      {"asset":"62429084067171308316390058541012087925567325563248051217584518806867987132248",
-       "size":46.2418,"avgPrice":0.2586,"initialValue":11.9599,"currentValue":0,"curPrice":0,
-       "redeemable":true,"title":"Will LeBron James play for the Miami Heat in 2026-27?"}
-    ]"#;
+    /// The live v1 capture of 2026-09-03 (`GET https://data-api.polymarket.com/positions?...
+    /// &user=POLY_FUNDER`), moved to the Data API v2 shape: the `data`/`pagination` envelope and
+    /// snake_case keys. **Derived from the published v2 contract (the migration guide and
+    /// `/v2/openapi.json`, read 2026-11-03), not a live v2 capture** — re-capture one real page
+    /// after the deploy (POLY_DATA_V2_SPEC.md §6). Trimmed to the fields the mark reads plus a
+    /// couple that prove the rest is ignored. Two rows: an open position, and a resolved loser
+    /// reporting `current_value: 0` with `redeemable: true`.
+    const POSITIONS_JSON: &str = r#"{
+      "data": [
+        {"token_id":"21294592205022969346730955103773391901993330222644504059576935265667917187903",
+         "current_size":40.0,"avg_price":0.1549,"current_value":4.42,"current_price":0.1105,
+         "redeemable":false,"title":"Will no Fed rate cuts happen in 2026?"},
+        {"token_id":"62429084067171308316390058541012087925567325563248051217584518806867987132248",
+         "current_size":46.2418,"avg_price":0.2586,"current_value":0,"current_price":0,
+         "redeemable":true,"title":"Will LeBron James play for the Miami Heat in 2026-27?"}
+      ],
+      "pagination": {"next_cursor": null}
+    }"#;
 
     fn rows(json: &str) -> Vec<Value> {
-        serde_json::from_str::<Value>(json).unwrap().as_array().unwrap().clone()
+        parse_positions_page(json).unwrap().0
     }
 
-    /// The live shape marks straight off the venue's own `currentValue`, and a resolved loser's
+    /// A v2 `/positions` body with these rows and this `next_cursor`.
+    fn page(rows: Value, next_cursor: Option<&str>) -> String {
+        json!({"data": rows, "pagination": {"next_cursor": next_cursor}}).to_string()
+    }
+
+    /// Run the cursor walk over canned bodies, served in order, and hand back what it returned
+    /// along with every path it asked for. Running out of bodies is an `Err`, not a panic, so a
+    /// walk that reads past the end shows up as a failed assertion.
+    async fn walk(bodies: Vec<String>) -> (Result<Vec<Value>>, Vec<String>) {
+        let mut paths = Vec::new();
+        let mut bodies = bodies.into_iter();
+        let result = walk_position_pages(|path| {
+            paths.push(path);
+            let body = bodies.next();
+            async move { body.ok_or_else(|| anyhow!("the walk read past the last canned page")) }
+        })
+        .await;
+        (result, paths)
+    }
+
+    fn token_ids(rows: &[Value]) -> Vec<&str> {
+        rows.iter()
+            .map(|r| r["token_id"].as_str().unwrap())
+            .collect()
+    }
+
+    /// The live shape marks straight off the venue's own `current_value`, and a resolved loser's
     /// zero is a valuation, not a missing mark.
     #[test]
     fn real_positions_mark_at_the_venue_value() {
@@ -850,7 +977,7 @@ mod tests {
         assert_eq!(marked[0].mark, 0.1105);
         assert_eq!(marked[0].value, 4.42);
         assert_eq!(marked[0].source, MarkSource::Venue);
-        // `currentValue` is the venue's own `size × curPrice`, to the cent.
+        // `current_value` is the venue's own `current_size × current_price`, to the cent.
         assert!((marked[0].value - marked[0].shares * marked[0].mark).abs() < 1e-6);
         assert_eq!(marked[1].value, 0.0);
         assert_eq!(marked_total(&marked), 4.42);
@@ -860,20 +987,159 @@ mod tests {
     #[test]
     fn a_flat_account_marks_to_zero() {
         assert_eq!(marked_total(&[]), 0.0);
-        assert!(rows("[]").is_empty());
+        assert!(rows(&page(json!([]), None)).is_empty());
     }
 
-    /// **Fail-closed.** A row with no `currentValue` is an `Err`, never a zero folded into the
+    /// **Fail-closed.** A row with no `current_value` is an `Err`, never a zero folded into the
     /// sum: a silently short total reads as a drawdown, and the breaker stops a live bot on one.
     #[test]
     fn a_row_missing_its_mark_is_an_error_not_a_short_total() {
-        let no_value = json!({"asset":"111","size":40.0,"avgPrice":0.1549,"curPrice":0.1105});
+        let no_value =
+            json!({"token_id":"111","current_size":40.0,"avg_price":0.1549,"current_price":0.1105});
         let err = parse_marked_position(&no_value).unwrap_err().to_string();
-        assert!(err.contains("currentValue"), "{err}");
+        assert!(err.contains("current_value"), "{err}");
 
-        let no_price = json!({"asset":"111","size":40.0,"avgPrice":0.1549,"currentValue":4.42});
+        let no_price =
+            json!({"token_id":"111","current_size":40.0,"avg_price":0.1549,"current_value":4.42});
         let err = parse_marked_position(&no_price).unwrap_err().to_string();
-        assert!(err.contains("curPrice"), "{err}");
+        assert!(err.contains("current_price"), "{err}");
+    }
+
+    /// PV2-T1. The rows and the cursor both come out of the envelope.
+    #[test]
+    fn positions_page_parses_the_v2_envelope() {
+        let body = page(json!([{"token_id":"1"}, {"token_id":"2"}]), Some("abc"));
+        let (rows, next_cursor) = parse_positions_page(&body).unwrap();
+        assert_eq!(token_ids(&rows), ["1", "2"]);
+        assert_eq!(next_cursor.as_deref(), Some("abc"));
+
+        let (rows, next_cursor) = parse_positions_page(POSITIONS_JSON).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(next_cursor, None);
+    }
+
+    /// PV2-T2. `data: null` is the v2 contract's documented miss: no positions, not an error.
+    #[test]
+    fn a_null_data_page_is_no_positions_not_an_error() {
+        let (rows, next_cursor) = parse_positions_page(&page(Value::Null, None)).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(next_cursor, None);
+    }
+
+    /// PV2-T3. A page that does not say whether it is the last is an `Err`, never an end: read as
+    /// one, it would cut the list short. So is a page with no `data`, and the bare v1 array.
+    #[test]
+    fn a_page_with_no_pagination_object_is_an_error() {
+        let err = parse_positions_page(r#"{"data":[{"token_id":"1"}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pagination"), "{err}");
+
+        let err = parse_positions_page(r#"{"data":[],"pagination":{}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("next_cursor"), "{err}");
+
+        let err = parse_positions_page(r#"{"pagination":{"next_cursor":null}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("data"), "{err}");
+
+        assert!(parse_positions_page(r#"[{"token_id":"1"}]"#).is_err());
+    }
+
+    /// PV2-T4. The cursor is opaque and may hold `+`, `/` and `=`; sent raw, `+` reads as a space.
+    /// And it carries none of the query, so every other parameter is repeated unchanged.
+    #[tokio::test]
+    async fn the_cursor_is_percent_encoded_and_every_filter_is_repeated() {
+        let first = positions_path(None, None);
+        assert_eq!(
+            first,
+            "/positions?filter_type=TOKENS&filter_amount=1&sort_by=TOKENS&sort_direction=DESC&limit=1000"
+        );
+        assert_eq!(
+            positions_path(None, Some("a+b/c=")),
+            format!("{first}&cursor=a%2Bb%2Fc%3D")
+        );
+
+        // The same through the walk: page two is page one's request plus the encoded cursor.
+        let (result, paths) = walk(vec![
+            page(json!([{"token_id":"1"}]), Some("a+b/c=")),
+            page(json!([{"token_id":"2"}]), None),
+        ])
+        .await;
+        assert_eq!(token_ids(&result.unwrap()), ["1", "2"]);
+        assert_eq!(
+            paths,
+            [first.clone(), format!("{first}&cursor=a%2Bb%2Fc%3D")]
+        );
+    }
+
+    /// PV2-T5. v2 answers any `offset`, even `0`, with HTTP 400 — and none of v1's spellings either.
+    #[tokio::test]
+    async fn the_first_request_never_carries_offset() {
+        for status in POSITIONS_PASSES {
+            for path in [
+                positions_path(status, None),
+                positions_path(status, Some("abc")),
+            ] {
+                assert!(!path.contains("offset"), "{path}");
+                assert!(!path.contains("sizeThreshold"), "{path}");
+                assert!(!path.contains("sortBy"), "{path}");
+            }
+        }
+        let (_, paths) = walk(vec![page(json!([]), None)]).await;
+        assert_eq!(paths.len(), 1);
+        assert!(!paths[0].contains("offset"), "{}", paths[0]);
+    }
+
+    /// PV2-T6. A cursor handed back twice would spin the walk forever; it is an `Err`, and the
+    /// walk stops asking.
+    #[tokio::test]
+    async fn a_repeated_cursor_is_an_error() {
+        let (result, paths) = walk(vec![
+            page(json!([{"token_id":"1"}]), Some("abc")),
+            page(json!([{"token_id":"2"}]), Some("abc")),
+            page(json!([]), None),
+        ])
+        .await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("same cursor twice"), "{err}");
+        assert_eq!(paths.len(), 2);
+    }
+
+    /// PV2-T7. Only a `null` cursor ends the walk. A one-row page and an empty page, each with a
+    /// cursor, are read on; and a token served again on a later page is kept once.
+    #[tokio::test]
+    async fn the_walk_stops_on_a_null_cursor_not_a_short_page() {
+        let (result, paths) = walk(vec![
+            page(json!([{"token_id":"1"}]), Some("abc")),
+            page(json!([]), Some("def")),
+            page(json!([{"token_id":"2"}, {"token_id":"1"}]), None),
+        ])
+        .await;
+        assert_eq!(token_ids(&result.unwrap()), ["1", "2"]);
+        assert_eq!(paths.len(), 3);
+    }
+
+    /// PV2-T8. A walk that never sees a `null` cursor is stopped at the bound with an `Err`. A
+    /// silent stop there would hand back a cut-short list, which reads as a flatter account than
+    /// the real one.
+    #[tokio::test]
+    async fn the_page_bound_is_an_error_not_a_truncation() {
+        let mut fetched = 0usize;
+        let result = walk_position_pages(|_path| {
+            fetched += 1;
+            let body = page(
+                json!([{"token_id": fetched.to_string()}]),
+                Some(&format!("c{fetched}")),
+            );
+            async move { Ok(body) }
+        })
+        .await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("truncated"), "{err}");
+        assert_eq!(fetched, POSITIONS_MAX_PAGES);
     }
 
     /// A market object shaped like the live world-cup-winner capture (2026-07-18, feeType

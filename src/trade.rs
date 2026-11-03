@@ -59,7 +59,11 @@ pub(crate) const HOST: &str = "https://clob.polymarket.com";
 /// Polymarket's second host. It serves exactly one thing this bot wants — `/positions`, the
 /// mark-to-market rows the drawdown breaker values the account from — and it is **unauthenticated**,
 /// keyed on `?user=<wallet>` rather than on a credential.
-pub(crate) const DATA_HOST: &str = "https://data-api.polymarket.com";
+///
+/// **Data API v2.** v1 (the bare host) was retired 2026-11-02 and answers every call with HTTP 410,
+/// so the marker now maps to `/v2`: `/data-api/positions?…` reaches `/v2/positions?…&user=<funder>`.
+/// v2 pages by `cursor` only and answers `offset` with HTTP 400 (`rest.rs` builds the query).
+pub(crate) const DATA_HOST: &str = "https://data-api.polymarket.com/v2";
 
 /// Routing marker for [`DATA_HOST`]. Not a path segment the venue ever sees: [`PolyL2Auth::url`]
 /// strips it, swaps the host and appends the wallet.
@@ -1588,10 +1592,18 @@ mod tests {
     #[test]
     fn the_data_api_path_is_rehosted_and_carries_the_funder() {
         let auth = data_auth();
-        let url = auth.url("/data-api/positions?sizeThreshold=1&limit=500");
+        let url = auth.url("/data-api/positions?filter_type=TOKENS&limit=1000");
         assert!(url.starts_with(DATA_HOST), "must leave the CLOB: {url}");
+        // Data API v2: v1 (the bare host) answers every call with HTTP 410 since 2026-11-02.
+        assert!(
+            url.starts_with("https://data-api.polymarket.com/v2/positions?"),
+            "must reach v2: {url}",
+        );
         assert!(!url.contains(HOST), "must not be sent to the CLOB: {url}");
-        assert!(url.contains("/positions?sizeThreshold=1&limit=500"), "{url}");
+        assert!(
+            url.contains("/positions?filter_type=TOKENS&limit=1000"),
+            "{url}"
+        );
         // Case-insensitively, because `Address`'s `Display` lowercases while the operator's old
         // `.env` string was usually EIP-55 checksummed. **That difference is safe and was measured,
         // not assumed** (2026-09-18, live): the same wallet queried checksummed, all-lower and
