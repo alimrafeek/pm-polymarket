@@ -51,6 +51,12 @@ pub struct PolymarketMarketDetails {
     pub neg_risk: bool,
     pub yes_token_id: String,
     pub no_token_id: String,
+    /// Gamma's two outcome names in token order, `[YES token's, NO token's]` (TEAM_LINKS_SPEC TL§3):
+    /// `["Yes", "No"]` on an ordinary market, `["Bengals", "Falcons"]` on a game. `None` where the
+    /// parser did not read exactly two outcomes and two tokens, and wherever these details were not
+    /// built by the parser (the engine's, off the wire). Display and checks only: never a key, and
+    /// nothing is skipped or refused for it here.
+    pub outcome_labels: Option<[String; 2]>,
     pub yes_bids: Arc<Mutex<Vec<OrderBookLevel>>>,
     pub yes_asks: Arc<Mutex<Vec<OrderBookLevel>>>,
     pub no_bids: Arc<Mutex<Vec<OrderBookLevel>>>,

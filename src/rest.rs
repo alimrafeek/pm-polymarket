@@ -57,8 +57,9 @@ pub fn iso8601_to_epoch(s: &str) -> Option<i64> {
 /// `pick_fields` before `parse_market_detail` runs). `feeSchedule` must stay in this list: it is
 /// the only place the per-market taker-fee curve exists — `feesEnabled`/`feeType` alone carry no
 /// rate, and dropping it silently zeroes the Polymarket fee leg in the arbitrage edge math. `slug`
-/// is the market's own address slug, kept for the alert notifier's links (`url_slug`).
-const MARKET_FIELDS: [&str; 17] = [
+/// is the market's own address slug, kept for the alert notifier's links (`url_slug`). `question`
+/// names a sports event's main market, which has no `groupItemTitle` (TEAM_LINKS_SPEC TL§3.3).
+const MARKET_FIELDS: [&str; 18] = [
     "acceptingOrders",
     "active",
     "archived",
@@ -75,6 +76,7 @@ const MARKET_FIELDS: [&str; 17] = [
     "orderPriceMinTickSize",
     "outcomePrices",
     "outcomes",
+    "question",
     "slug",
 ];
 
@@ -806,11 +808,27 @@ async fn parse_market_detail(
         let market_slug = if is_single_market {
             outer_slug.to_string()
         } else {
-            market
-                .get("groupItemTitle")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("groupItemTitle missing"))?
-                .to_string()
+            match market.get("groupItemTitle").and_then(|v| v.as_str()) {
+                Some(title) => title.to_string(),
+                // TEAM_LINKS_SPEC TL§3.3: a sports event's main market (its moneyline) has no
+                // `groupItemTitle`; its `question` names it. With neither, this one market is skipped
+                // and the rest of the event still parses. Before, the whole event failed.
+                None => match market
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|q| !q.is_empty())
+                {
+                    Some(question) => question.to_string(),
+                    None => {
+                        skipped.push(MarketSkip::new(
+                            &display_name,
+                            "no groupItemTitle and no question to name it by".to_string(),
+                        ));
+                        continue;
+                    }
+                },
+            }
         };
 
         // The market's own address slug, for links that open the market itself. Not
@@ -832,6 +850,19 @@ async fn parse_market_detail(
         if clob_token_ids.len() < 2 {
             return Err(anyhow!("clobTokenIds must contain at least 2 elements"));
         }
+
+        // TEAM_LINKS_SPEC TL§3.2: the outcome names, in `clobTokenIds` order. Read 2026-11-08 on
+        // `nfl-cin-atl-2026-11-08`: outcomes ["Bengals", "Falcons"], outcomePrices ["0.565", "0.435"],
+        // and the market's bestBid/bestAsk 0.56/0.57 are token [0]'s, so [0] is the first-named outcome.
+        // Only a clean pair of two names over two tokens is kept; anything else is `None` and the market
+        // parses exactly as it did before (TL-S2).
+        let outcome_labels = market
+            .get("outcomes")
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .filter(|o| o.len() == 2 && clob_token_ids.len() == 2)
+            .map(|o| [o[0].trim().to_string(), o[1].trim().to_string()])
+            .filter(|[yes, no]| !yes.is_empty() && !no.is_empty());
 
         let tick_size = market
             .get("orderPriceMinTickSize")
@@ -898,6 +929,7 @@ async fn parse_market_detail(
             neg_risk,
             yes_token_id: clob_token_ids[0].clone(),
             no_token_id: clob_token_ids[1].clone(),
+            outcome_labels,
             yes_bids: Arc::new(Mutex::new(Vec::new())),
             yes_asks: Arc::new(Mutex::new(Vec::new())),
             no_bids: Arc::new(Mutex::new(Vec::new())),
@@ -1334,6 +1366,124 @@ mod tests {
         assert!(picked["acceptingOrders"].is_null(), "fixture omits the flag");
         let event = json!({ "id": "1", "slug": "no-flags", "markets": [picked] });
         assert_eq!(parse_market_detail(event).await.unwrap().0.len(), 1);
+    }
+
+    /// TEAM_LINKS_SPEC TL§3.5: the game market, trimmed from the 2026-11-08 Gamma read of
+    /// `nfl-cin-atl-2026-11-08`, with made-up token ids. It has no `groupItemTitle`.
+    fn raw_game_market() -> Value {
+        json!({
+            "id": "900",
+            "question": "Bengals vs. Falcons",
+            "slug": "nfl-cin-atl-2026-11-08",
+            "outcomes": "[\"Bengals\", \"Falcons\"]",
+            "outcomePrices": "[\"0.565\", \"0.435\"]",
+            "clobTokenIds": "[\"111\", \"222\"]",
+            "active": true,
+            "closed": false,
+            "acceptingOrders": true,
+            "orderPriceMinTickSize": 0.01,
+            "endDate": "2026-11-08T14:30:00Z",
+            "negRisk": false,
+            "feesEnabled": false
+        })
+    }
+
+    /// The spread beside it, as Gamma lists it.
+    fn raw_spread_market() -> Value {
+        json!({
+            "id": "901",
+            "question": "Spread: Bengals (-1.5)",
+            "groupItemTitle": "Spread -1.5",
+            "outcomes": "[\"Bengals\", \"Falcons\"]",
+            "outcomePrices": "[\"0.53\", \"0.47\"]",
+            "clobTokenIds": "[\"333\", \"444\"]",
+            "orderPriceMinTickSize": 0.01,
+            "endDate": "2026-11-08T14:30:00Z"
+        })
+    }
+
+    fn game_event(game: &Value) -> Value {
+        json!({
+            "id": "77",
+            "slug": "nfl-cin-atl-2026-11-08",
+            "markets": [
+                pick_fields(game, &MARKET_FIELDS),
+                pick_fields(&raw_spread_market(), &MARKET_FIELDS)
+            ]
+        })
+    }
+
+    fn labels(a: &str, b: &str) -> Option<[String; 2]> {
+        Some([a.to_string(), b.to_string()])
+    }
+
+    /// TP1. A sports event's main market has no `groupItemTitle`: its `question` names it, the
+    /// event still parses, and both markets carry their outcome names in token order.
+    #[tokio::test]
+    async fn a_moneyline_without_group_item_title_is_named_by_its_question() {
+        let (details, skipped) = parse_market_detail(game_event(&raw_game_market())).await.unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].market_slug, "Bengals vs. Falcons");
+        assert_eq!(details[0].yes_token_id, "111");
+        assert_eq!(details[0].no_token_id, "222");
+        assert_eq!(details[0].outcome_labels, labels("Bengals", "Falcons"));
+        assert_eq!(details[1].market_slug, "Spread -1.5");
+        assert_eq!(details[1].outcome_labels, labels("Bengals", "Falcons"));
+    }
+
+    /// TP2. An ordinary market carries `["Yes", "No"]`.
+    #[tokio::test]
+    async fn a_yes_no_market_carries_yes_and_no() {
+        let picked = pick_fields(&raw_sports_market(), &MARKET_FIELDS);
+        let event = json!({ "id": "27799", "slug": "world-cup-winner", "markets": [picked] });
+        let (details, _) = parse_market_detail(event).await.unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].outcome_labels, labels("Yes", "No"));
+    }
+
+    /// TP3. Labels never skip or refuse a market (TL-S2): without a clean pair of two names over two
+    /// tokens the labels are `None` and the market parses as it always did.
+    #[tokio::test]
+    async fn labels_that_are_not_a_clean_pair_change_nothing() {
+        let mut no_outcomes = raw_game_market();
+        no_outcomes.as_object_mut().unwrap().remove("outcomes");
+        let mut three_names = raw_game_market();
+        three_names["outcomes"] = json!("[\"Bengals\", \"Falcons\", \"Tie\"]");
+        let mut three_tokens = raw_game_market();
+        three_tokens["clobTokenIds"] = json!("[\"111\", \"222\", \"333\"]");
+
+        for game in [no_outcomes, three_names, three_tokens] {
+            let (details, skipped) = parse_market_detail(game_event(&game)).await.unwrap();
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(details.len(), 2);
+            assert_eq!(details[0].market_slug, "Bengals vs. Falcons");
+            assert_eq!(details[0].yes_token_id, "111");
+            assert_eq!(details[0].no_token_id, "222");
+            assert_eq!(details[0].outcome_labels, None);
+            assert_eq!(details[1].market_slug, "Spread -1.5");
+            assert_eq!(details[1].outcome_labels, labels("Bengals", "Falcons"));
+        }
+    }
+
+    /// TP4. A market with neither `groupItemTitle` nor `question` is skipped with a reason; the
+    /// event still parses (before, the whole event failed).
+    #[tokio::test]
+    async fn a_market_with_no_name_is_skipped_not_fatal() {
+        let mut game = raw_game_market();
+        game.as_object_mut().unwrap().remove("question");
+        let (details, skipped) = parse_market_detail(game_event(&game)).await.unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].market_slug, "Spread -1.5");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, "no groupItemTitle and no question to name it by");
+    }
+
+    /// TP5. `question` must survive the field filter, or the name fallback never sees it.
+    #[tokio::test]
+    async fn question_survives_field_filter() {
+        let picked = pick_fields(&raw_game_market(), &MARKET_FIELDS);
+        assert_eq!(picked["question"], json!("Bengals vs. Falcons"));
     }
 
     // ---------------------------------------------------------------------------------------
