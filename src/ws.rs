@@ -525,7 +525,7 @@ async fn blank_books(asset_ids: &[String], books: &PolyBooks) {
         let Some(token) = books.unit(id) else { continue };
         token.bids.lock().await.clear();
         token.asks.lock().await.clear();
-        token.change.notify_one();
+        token.notify();
     }
 }
 
@@ -869,7 +869,7 @@ async fn apply_book_snapshot(book: &Value, books: &PolyBooks, recv_us: u64) -> R
 
     sort_levels(&token.bids, &token.asks).await;
     token.stamp.set(FeedStamp { venue_ms: event_ms(book), recv_us });
-    token.change.notify_one();
+    token.notify();
     Ok(())
 }
 
@@ -917,7 +917,7 @@ async fn apply_price_change(event: &Value, books: &PolyBooks, recv_us: u64) -> R
 
         sort_levels(&token.bids, &token.asks).await;
         token.stamp.set(FeedStamp { venue_ms, recv_us });
-        token.change.notify_one();
+        token.notify();
     }
 
     Ok(())
@@ -954,7 +954,7 @@ mod tests {
             bids: Arc::new(Mutex::new(vec![OrderBookLevel { price: 0.40, size: 100.0 }])),
             asks: Arc::new(Mutex::new(vec![OrderBookLevel { price: 0.60, size: 100.0 }])),
             tick_size: Arc::new(Mutex::new(0.01)),
-            change: Arc::new(Notify::new()),
+            change: vec![Arc::new(Notify::new())],
             stamp: Arc::default(),
         }
     }
@@ -988,6 +988,54 @@ mod tests {
             FeedStamp { venue_ms: 1700000000000, recv_us: 42 }
         );
         assert_eq!(books.unit("b").unwrap().stamp.get(), FeedStamp::default());
+    }
+
+    /// A routing map whose token "a" is read by two markets (TEAM_LINKS_SPEC TL§6): one notifier
+    /// each, handed back so a test can wait on them.
+    fn books_shared_by_two_markets() -> (PolyBooks, Arc<Notify>, Arc<Notify>) {
+        let (first, second) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let mut book = book_with_levels("Market / YES");
+        book.change = vec![first.clone(), second.clone()];
+        let books = Registry::from_map_active(HashMap::from([("a".to_string(), book)]));
+        (books, first, second)
+    }
+
+    #[tokio::test]
+    async fn a_price_change_wakes_every_market_on_the_token() {
+        let (books, first, second) = books_shared_by_two_markets();
+
+        apply_price_change(
+            &json!({
+                "event_type": "price_change",
+                "timestamp": "1700000000000",
+                "price_changes": [{ "asset_id": "a", "price": "0.41", "size": "50", "side": "BUY" }],
+            }),
+            &books,
+            42,
+        )
+        .await
+        .unwrap();
+
+        let within = Duration::from_millis(100);
+        assert!(tokio::time::timeout(within, first.notified()).await.is_ok(), "first market woke");
+        assert!(
+            tokio::time::timeout(within, second.notified()).await.is_ok(),
+            "second market woke"
+        );
+    }
+
+    #[tokio::test]
+    async fn blanking_wakes_every_market_on_the_token() {
+        let (books, first, second) = books_shared_by_two_markets();
+
+        blank_books(&ids(&["a"]), &books).await;
+
+        let within = Duration::from_millis(100);
+        assert!(tokio::time::timeout(within, first.notified()).await.is_ok(), "first market woke");
+        assert!(
+            tokio::time::timeout(within, second.notified()).await.is_ok(),
+            "second market woke"
+        );
     }
 
     #[test]

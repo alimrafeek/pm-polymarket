@@ -90,9 +90,18 @@ pub struct PolyTokenBook {
     pub bids: Arc<Mutex<Vec<OrderBookLevel>>>,
     pub asks: Arc<Mutex<Vec<OrderBookLevel>>>,
     pub tick_size: Arc<Mutex<f64>>,
-    /// This market's change notifier; the WS handler fires it after applying an update.
-    pub change: Arc<Notify>,
+    /// Every market reading this token, one notifier each (TEAM_LINKS_SPEC TL§6): a team market and its twin share both tokens. The WS handler wakes them all after applying an update.
+    pub change: Vec<Arc<Notify>>,
     /// Where this token's current book came from (LATENCY_TRACE_SPEC). Written by the WS handler
     /// with every update it applies; read by whoever publishes the book.
     pub stamp: Arc<BookStamp>,
+}
+
+impl PolyTokenBook {
+    /// Wake every market reading this token (TEAM_LINKS_SPEC TL§6).
+    pub fn notify(&self) {
+        for n in &self.change {
+            n.notify_one();
+        }
+    }
 }
