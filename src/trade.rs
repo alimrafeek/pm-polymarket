@@ -908,6 +908,12 @@ impl PolyTrader {
             .await
     }
 
+    /// The create twin of [`Self::derive_api_key_variant`]: mint a credential triple for `account`
+    /// with the chosen L1 binding (POST /auth/api-key). KEYS' check uses the EOA, plain signature.
+    pub async fn create_api_key_variant(&self, account: Address, wrapped: bool) -> Result<PolyApiCreds> {
+        self.api_key_request(reqwest::Method::POST, "/auth/api-key", account, wrapped).await
+    }
+
     /// Probe variant used by the manual `poly-derive-key` command to pin down which L1 binding
     /// the CLOB accepts: any `account` (deposit wallet or EOA), wrapped or plain signature.
     pub async fn derive_api_key_variant(
