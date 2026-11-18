@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::types::{PolymarketFeeSchedule, PolymarketMarketDetails, DEFAULT_MIN_ORDER_SIZE};
-use venue_core::log::{get_timestamp_ist, log_event, MarketSkip};
+use venue_core::log::{get_timestamp_ist, log_event, Ended, MarketSkip};
 use venue_core::trade::{marked_total, MarkSource, MarkedPosition, PortfolioValue};
 
 fn get_value(obj: &Value, key: &str) -> Value {
@@ -701,8 +701,71 @@ pub async fn cancel_poly_order(
     Ok(serde_json::from_str(&text)?)
 }
 
+/// The market's YES token: the first element of `clobTokenIds` (a JSON array encoded as a string),
+/// when it is non-empty. `None` on any failure. It is the key the store gives the child
+/// (SETTLING S2S§2.3).
+fn yes_token(market: &Value) -> Option<String> {
+    let ids: Vec<String> = serde_json::from_str(market.get("clobTokenIds")?.as_str()?).ok()?;
+    ids.into_iter().next().filter(|id| !id.is_empty())
+}
+
+/// `outcomePrices` (a JSON array of strings, encoded as a string) as a (YES, NO) pair of numbers.
+/// `None` unless it has two entries and both read as numbers.
+fn outcome_pair(market: &Value) -> Option<(f64, f64)> {
+    let prices: Vec<String> = serde_json::from_str(market.get("outcomePrices")?.as_str()?).ok()?;
+    let yes = prices.first()?.trim().parse().ok()?;
+    let no = prices.get(1)?.trim().parse().ok()?;
+    Some((yes, no))
+}
+
+/// A pair that says who won: `1`/`0` or `0`/`1`.
+fn pair_is_decided(pair: (f64, f64)) -> bool {
+    pair == (1.0, 0.0) || pair == (0.0, 1.0)
+}
+
+/// A pair a closed market settled at: decided, or the `0.5`/`0.5` of a cancelled market. An open
+/// book can sit at `0.5`/`0.5`, so only a closed market may use this one.
+fn pair_is_final(pair: (f64, f64)) -> bool {
+    pair_is_decided(pair) || pair == (0.5, 0.5)
+}
+
+/// The market's `endDate`, read as `resolution_time` is, is at or before `now_s`. An `endDate`
+/// that is absent or does not read is never past: a pause there stays a pause.
+fn past_its_end(market: &Value, now_s: i64) -> bool {
+    market
+        .get("endDate")
+        .and_then(Value::as_str)
+        .and_then(iso8601_to_epoch)
+        .is_some_and(|end| end <= now_s)
+}
+
+/// A skip that names what the venue said: with a key and an `ended` only when both are known, else
+/// the plain skip (the store cannot place a market with no key).
+fn skip_with(name: &str, reason: String, key: Option<String>, ended: Option<Ended>) -> MarketSkip {
+    match (key, ended) {
+        (Some(key), Some(ended)) => MarketSkip::ended(name, reason, key, ended),
+        _ => MarketSkip::new(name, reason),
+    }
+}
+
+/// The system clock as Unix seconds.
+fn unix_now_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 async fn parse_market_detail(
     value: Value,
+) -> Result<(Vec<PolymarketMarketDetails>, Vec<MarketSkip>)> {
+    parse_market_detail_at(value, unix_now_s())
+}
+
+/// [`parse_market_detail`] with the clock passed in, so a test can fix `now_s` (Unix seconds).
+fn parse_market_detail_at(
+    value: Value,
+    now_s: i64,
 ) -> Result<(Vec<PolymarketMarketDetails>, Vec<MarketSkip>)> {
     let markets = value
         .get("markets")
@@ -767,7 +830,25 @@ async fn parse_market_detail(
             .map(|(_, _, label)| label)
             .collect::<Vec<_>>()
             .join(", ");
-            skipped.push(MarketSkip::new(&display_name, format!("untradeable ({why})")));
+            // SETTLING S2S§2.3: what the venue said. A closed or archived market is `ended`, and
+            // `Resolved` only when its prices are final. A market that is merely paused
+            // (`active: false`, `acceptingOrders: false`) is `ended` only once its `endDate` has
+            // passed, and `Resolved` only on a decided pair; before that it is a pause (SE2).
+            let ended = if flag("closed", false) || flag("archived", false) {
+                let final_prices = outcome_pair(market).is_some_and(pair_is_final);
+                Some(if final_prices { Ended::Resolved } else { Ended::Closed })
+            } else if past_its_end(market, now_s) {
+                let decided = outcome_pair(market).is_some_and(pair_is_decided);
+                Some(if decided { Ended::Resolved } else { Ended::Closed })
+            } else {
+                None
+            };
+            skipped.push(skip_with(
+                &display_name,
+                format!("untradeable ({why})"),
+                yes_token(market),
+                ended,
+            ));
             continue;
         }
 
@@ -786,9 +867,11 @@ async fn parse_market_detail(
             if (yes_price == "0" && no_price == "1")
                 || (yes_price == "1" && no_price == "0")
             {
-                skipped.push(MarketSkip::new(
+                skipped.push(skip_with(
                     &display_name,
                     format!("already resolved (outcomePrices {yes_price}/{no_price})"),
+                    yes_token(market),
+                    Some(Ended::Resolved),
                 ));
                 continue;
             }
@@ -1192,6 +1275,131 @@ mod tests {
             "feeSchedule": { "exponent": 1, "rate": 0.05, "rebateRate": 0.15, "takerOnly": true },
             "volume": "1234.5"
         })
+    }
+
+    /// The one skip a one-market event gives when `edit` is applied to `raw_sports_market()`, parsed
+    /// with the clock fixed at 2026-11-08T22:00:00Z (SETTLING S2S§2.3).
+    fn s2t3_skip(edit: impl FnOnce(&mut Value)) -> MarketSkip {
+        let mut raw = raw_sports_market();
+        edit(&mut raw);
+        let event = json!({
+            "id": "27799",
+            "slug": "world-cup-winner",
+            "markets": [pick_fields(&raw, &MARKET_FIELDS)],
+        });
+        let now_s = iso8601_to_epoch("2026-11-08T22:00:00Z").unwrap();
+        let (details, mut skipped) = parse_market_detail_at(event, now_s).unwrap();
+        assert!(details.is_empty(), "the market must be skipped");
+        assert_eq!(skipped.len(), 1);
+        skipped.remove(0)
+    }
+
+    /// S2T3: what each closed, archived, paused and already-resolved market says about itself.
+    #[test]
+    fn s2t3_a_skip_carries_the_yes_token_and_ended_the_venue_named() {
+        let yes = Some("111".to_string());
+
+        // closed, final prices → Resolved, with the YES token (the first of clobTokenIds).
+        let s = s2t3_skip(|m| {
+            m["closed"] = json!(true);
+            m["outcomePrices"] = json!("[\"1\", \"0\"]");
+        });
+        assert_eq!((s.key.clone(), s.ended), (yes.clone(), Some(Ended::Resolved)));
+        assert_eq!(s.name, "Spain");
+        assert_eq!(s.reason, "untradeable (closed)");
+
+        // closed, a live price → Closed.
+        let s = s2t3_skip(|m| {
+            m["closed"] = json!(true);
+            m["outcomePrices"] = json!("[\"0.42\", \"0.58\"]");
+        });
+        assert_eq!((s.key.clone(), s.ended), (yes.clone(), Some(Ended::Closed)));
+
+        // closed at 0.5/0.5 (a cancelled market) → Resolved: final for a closed market.
+        let s = s2t3_skip(|m| {
+            m["closed"] = json!(true);
+            m["outcomePrices"] = json!("[\"0.5\", \"0.5\"]");
+        });
+        assert_eq!((s.key.clone(), s.ended), (yes.clone(), Some(Ended::Resolved)));
+
+        // archived, prices not final → Closed.
+        let s = s2t3_skip(|m| m["archived"] = json!(true));
+        assert_eq!((s.key.clone(), s.ended), (yes.clone(), Some(Ended::Closed)));
+        assert_eq!(s.reason, "untradeable (archived)");
+
+        // acceptingOrders false, past its endDate, a live price → Closed.
+        let past = |m: &mut Value, prices: &str| {
+            m["acceptingOrders"] = json!(false);
+            m["endDate"] = json!("2026-11-08T21:00:00Z");
+            m["outcomePrices"] = json!(prices);
+        };
+        let s = s2t3_skip(|m| past(m, "[\"0.6\", \"0.4\"]"));
+        assert_eq!((s.key.clone(), s.ended), (yes.clone(), Some(Ended::Closed)));
+        assert_eq!(s.reason, "untradeable (acceptingOrders: false)");
+
+        // …the same with a decided pair → Resolved.
+        let s = s2t3_skip(|m| past(m, "[\"1\", \"0\"]"));
+        assert_eq!((s.key.clone(), s.ended), (yes.clone(), Some(Ended::Resolved)));
+
+        // …a past pause at 0.5/0.5 is not a decided pair: an open book can sit there → Closed.
+        let s = s2t3_skip(|m| past(m, "[\"0.5\", \"0.5\"]"));
+        assert_eq!((s.key.clone(), s.ended), (yes.clone(), Some(Ended::Closed)));
+
+        // acceptingOrders false before its endDate → a pause: no ended, no key.
+        let s = s2t3_skip(|m| {
+            m["acceptingOrders"] = json!(false);
+            m["endDate"] = json!("2026-12-01T00:00:00Z");
+        });
+        assert_eq!((s.key, s.ended), (None, None));
+        assert_eq!(s.reason, "untradeable (acceptingOrders: false)");
+
+        // …even with a decided pair: not past its end, so still a pause.
+        let s = s2t3_skip(|m| {
+            m["acceptingOrders"] = json!(false);
+            m["endDate"] = json!("2026-12-01T00:00:00Z");
+            m["outcomePrices"] = json!("[\"1\", \"0\"]");
+        });
+        assert_eq!((s.key, s.ended), (None, None));
+
+        // active false with no endDate → a pause (an absent endDate is never past).
+        let s = s2t3_skip(|m| {
+            m["active"] = json!(false);
+            m.as_object_mut().unwrap().remove("endDate");
+        });
+        assert_eq!((s.key, s.ended), (None, None));
+        assert_eq!(s.reason, "untradeable (active: false)");
+
+        // …and an endDate that does not read is the same.
+        let s = s2t3_skip(|m| {
+            m["active"] = json!(false);
+            m["endDate"] = json!("soon");
+        });
+        assert_eq!((s.key, s.ended), (None, None));
+
+        // open, `0`/`1` → the already-resolved branch → Resolved.
+        let s = s2t3_skip(|m| m["outcomePrices"] = json!("[\"0\", \"1\"]"));
+        assert_eq!((s.key.clone(), s.ended), (yes.clone(), Some(Ended::Resolved)));
+        assert_eq!(s.reason, "already resolved (outcomePrices 0/1)");
+
+        // closed with a malformed clobTokenIds → no key, so no ended: the plain skip.
+        let s = s2t3_skip(|m| {
+            m["closed"] = json!(true);
+            m["clobTokenIds"] = json!("not json");
+        });
+        assert_eq!((s.key, s.ended), (None, None));
+        assert_eq!(s.reason, "untradeable (closed)");
+    }
+
+    /// `yes_token` is the first `clobTokenIds` element, and `None` whenever it cannot be read.
+    #[test]
+    fn s2t3_yes_token_is_the_first_clob_token_or_none() {
+        let tok = |v: Value| yes_token(&json!({ "clobTokenIds": v }));
+        assert_eq!(tok(json!("[\"111\", \"222\"]")).as_deref(), Some("111"));
+        assert_eq!(tok(json!("[\"\", \"222\"]")), None, "an empty token is no key");
+        assert_eq!(tok(json!("[]")), None);
+        assert_eq!(tok(json!("not json")), None);
+        assert_eq!(tok(json!(["111"])), None, "not a string");
+        assert_eq!(yes_token(&json!({})), None);
     }
 
     /// Regression: `feeSchedule` must survive the event field filter. It was missing from the
