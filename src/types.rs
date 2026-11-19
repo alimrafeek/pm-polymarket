@@ -46,6 +46,15 @@ pub struct PolymarketMarketDetails {
     /// `endDate` (UTC). Uses the per-market value, not the event-level `endDate`, which can be years
     /// off. Directly comparable with `OpinionMarketDetails::resolution_time`. 0 if unavailable.
     pub resolution_time: i64,
+    /// Gamma's market-level `secondsDelay`: on a sports market Polymarket holds each marketable
+    /// order this many seconds before it matches, and acks it `"status":"delayed"` with empty
+    /// amounts. 1 on almost every sports league, 3 on some esports and cricket, 0 on NBA (sampled
+    /// 2026-11-19); the value is the same before, during and after the game. 0 when Gamma omits it.
+    pub seconds_delay: u32,
+    /// Gamma's market-level `gameStartTime` (`"2026-11-13 08:30:00+00"`, UTC) as Unix epoch
+    /// seconds: the scheduled start of the game. Not `resolution_time`, which equals the start on
+    /// most leagues but is days later on others (NBL moneyline, tennis, UFC). 0 when absent.
+    pub game_start_time: i64,
     /// Whether this market settles through the neg-risk exchange contract, which changes the
     /// EIP-712 domain orders must be signed against. From the market-level `negRisk` flag.
     pub neg_risk: bool,

@@ -59,7 +59,8 @@ pub fn iso8601_to_epoch(s: &str) -> Option<i64> {
 /// rate, and dropping it silently zeroes the Polymarket fee leg in the arbitrage edge math. `slug`
 /// is the market's own address slug, kept for the alert notifier's links (`url_slug`). `question`
 /// names a sports event's main market, which has no `groupItemTitle` (TEAM_LINKS_SPEC TL§3.3).
-const MARKET_FIELDS: [&str; 18] = [
+/// `secondsDelay` and `gameStartTime` feed the engine's live-game entry gate.
+const MARKET_FIELDS: [&str; 20] = [
     "acceptingOrders",
     "active",
     "archived",
@@ -70,6 +71,7 @@ const MARKET_FIELDS: [&str; 18] = [
     "feeSchedule",
     "feeType",
     "feesEnabled",
+    "gameStartTime",
     "groupItemTitle",
     "id",
     "negRisk",
@@ -77,6 +79,7 @@ const MARKET_FIELDS: [&str; 18] = [
     "outcomePrices",
     "outcomes",
     "question",
+    "secondsDelay",
     "slug",
 ];
 
@@ -969,6 +972,21 @@ fn parse_market_detail_at(
             .and_then(iso8601_to_epoch)
             .unwrap_or(0);
 
+        // The live-game delay and the game's scheduled start. Both default to 0 (absent, null or
+        // unreadable) rather than failing the event. Gamma writes `gameStartTime` with a space, not
+        // a `T`, between date and time ("2026-11-13 08:30:00+00"), so the first space becomes a `T`
+        // before the shared ISO parser reads it.
+        let seconds_delay = market
+            .get("secondsDelay")
+            .and_then(Value::as_u64)
+            .and_then(|s| u32::try_from(s).ok())
+            .unwrap_or(0);
+        let game_start_time = market
+            .get("gameStartTime")
+            .and_then(Value::as_str)
+            .and_then(|s| iso8601_to_epoch(&s.trim().replacen(' ', "T", 1)))
+            .unwrap_or(0);
+
         // Neg-risk markets settle through a different exchange contract, which changes the order
         // signature — the trader must know this per market. Absent field = normal market.
         let neg_risk = market
@@ -1009,6 +1027,8 @@ fn parse_market_detail_at(
             market_slug,
             url_slug,
             resolution_time,
+            seconds_delay,
+            game_start_time,
             neg_risk,
             yes_token_id: clob_token_ids[0].clone(),
             no_token_id: clob_token_ids[1].clone(),
@@ -1275,6 +1295,54 @@ mod tests {
             "feeSchedule": { "exponent": 1, "rate": 0.05, "rebateRate": 0.15, "takerOnly": true },
             "volume": "1234.5"
         })
+    }
+
+    /// `secondsDelay` and `gameStartTime` survive `pick_fields` and parse: the game start is written
+    /// with a space, as Gamma sends it. A market without them reads 0 for both, and so does one whose
+    /// values do not read.
+    #[test]
+    fn live_game_delay_and_game_start_parse() {
+        let parse = |edit: &dyn Fn(&mut Value)| {
+            let mut raw = raw_sports_market();
+            edit(&mut raw);
+            let event = json!({
+                "id": "27799",
+                "slug": "bknbl-cai-syd-2026-11-13",
+                "markets": [pick_fields(&raw, &MARKET_FIELDS)],
+            });
+            let now_s = iso8601_to_epoch("2026-07-01T00:00:00Z").unwrap();
+            let (mut details, _) = parse_market_detail_at(event, now_s).unwrap();
+            assert_eq!(details.len(), 1, "the market must parse");
+            let d = details.remove(0);
+            (d.seconds_delay, d.game_start_time)
+        };
+
+        let start = iso8601_to_epoch("2026-11-13T08:30:00Z").unwrap();
+        let got = parse(&|m| {
+            m["secondsDelay"] = json!(1);
+            m["gameStartTime"] = json!("2026-11-13 08:30:00+00");
+        });
+        assert_eq!(got, (1, start));
+
+        // The ISO form reads the same.
+        let got = parse(&|m| {
+            m["secondsDelay"] = json!(3);
+            m["gameStartTime"] = json!("2026-11-13T08:30:00Z");
+        });
+        assert_eq!(got, (3, start));
+
+        // Absent, null or unreadable: 0.
+        assert_eq!(parse(&|_| {}), (0, 0));
+        let got = parse(&|m| {
+            m["secondsDelay"] = Value::Null;
+            m["gameStartTime"] = Value::Null;
+        });
+        assert_eq!(got, (0, 0));
+        let got = parse(&|m| {
+            m["secondsDelay"] = json!("1");
+            m["gameStartTime"] = json!("soon");
+        });
+        assert_eq!(got, (0, 0));
     }
 
     /// The one skip a one-market event gives when `edit` is applied to `raw_sports_market()`, parsed
