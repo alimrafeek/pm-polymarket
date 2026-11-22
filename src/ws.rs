@@ -906,7 +906,16 @@ async fn apply_book_snapshot(book: &Value, books: &PolyBooks, recv_us: u64) -> R
     *token.asks.lock().await = parse_levels(&book["asks"])?;
 
     if let Some(tick) = book["tick_size"].as_str().and_then(|t| t.parse::<f64>().ok()) {
-        *token.tick_size.lock().await = tick;
+        let old = std::mem::replace(&mut *token.tick_size.lock().await, tick);
+        // A snapshot (each subscribe or reconnect) can carry a new tick with no `tick_size_change`
+        // frame. Log it, so a tick change is never silent. Not behind `ws_debug()`: it is rare.
+        if (old - tick).abs() >= 1e-12 {
+            println!(
+                "[{}] : [poly-ws] book snapshot tick {}: {old} -> {tick}",
+                get_timestamp_ist(),
+                token.label
+            );
+        }
     }
 
     sort_levels(&token.bids, &token.asks).await;
