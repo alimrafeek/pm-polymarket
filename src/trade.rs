@@ -47,7 +47,7 @@ use uuid::Uuid;
 use venue_core::log::{get_timestamp_ist, log_event};
 use venue_core::trade::{
     generate_salt, parse_private_key, probe_round_trips, required_env, retry_on_connect,
-    sign_digest_hex, venue_http_builder, ProbeRun, Side, VenueRejected,
+    sign_digest_hex, venue_http_builder, NotSent, ProbeRun, Side, VenueRejected,
 };
 use venue_core::transport::{
     Direct, Intent, OrderIntent, RequestAuth, VenueKind, VenueRequest, VenueResponse,
@@ -718,8 +718,20 @@ impl PolyTrader {
         // re-snap see the same values rather than ones a tick apart. In Direct mode nothing moves —
         // the snap is idempotent, and the gateway re-runs it on the far side either way.
         let tick_size = tick_size.normalize();
-        let price = price.round_dp(tick_size.scale()).normalize();
+        // Never rounded to a different price (POLY_TICK_SPEC D3): a price finer than our tick means
+        // the tick is stale, and either direction of rounding would send a price nobody judged.
+        let price = snap_to_tick(price, tick_size)?;
         let size = size.trunc_with_scale(LOT_SIZE_SCALE).normalize();
+        if side == Side::Buy
+            && matches!(order_type, PolyOrderType::Fak | PolyOrderType::Fok)
+            && !market_buy_amount_ok(size, price)
+        {
+            return Err(NotSent::wrap(anyhow!(
+                "polymarket market BUY {size} @ {price}: amount {} has more than 2 decimals \
+                 — Polymarket refuses it; not sent",
+                (size * price).normalize()
+            )));
+        }
         let what = format!("polymarket order {} {side:?} {size} @ {price}", order_type.wire());
         let resp = match self.signer.as_ref() {
             // Direct: this process holds the key, so it builds, signs and sends exactly as before.
@@ -998,6 +1010,30 @@ fn to_fixed_u128(d: Decimal) -> u128 {
         .unsigned_abs()
         .try_into()
         .expect("value doesn't fit u128")
+}
+
+/// `price` on the `tick` grid, or `NotSent` when it is not.
+///
+/// `round_dp` here only strips float dust: an engine `f64` such as 0.89 can arrive as
+/// 0.8900000000000001, and a difference within 1e-9 is dust. A real off-grid price is at least half
+/// a tick away (0.0005 on the finest tick), so it is refused, never moved. A price finer than our
+/// tick proves our tick is stale (POLY_TICK_SPEC D3).
+fn snap_to_tick(price: Decimal, tick: Decimal) -> Result<Decimal> {
+    let tick = tick.normalize();
+    let snapped = price.round_dp(tick.scale()).normalize();
+    if (snapped - price).abs() > Decimal::new(1, 9) {
+        return Err(NotSent::wrap(anyhow!(
+            "polymarket price {price} is off the {tick} tick grid \
+             (our tick is likely stale) — not sent"
+        )));
+    }
+    Ok(snapped)
+}
+
+/// Whether a FAK/FOK BUY of `size` shares at `price` has an amount (size × price) of at most 2
+/// decimals, which is all Polymarket accepts for a market buy's maker amount (POLY_TICK_SPEC D5).
+fn market_buy_amount_ok(size: Decimal, price: Decimal) -> bool {
+    (size * price).normalize().scale() <= 2
 }
 
 fn build_limit_order(
@@ -1283,6 +1319,7 @@ mod tests {
         assert!(format!("{err:#}").contains("holds no signing key"), "{err:#}");
     }
     use rust_decimal_macros::dec;
+    use venue_core::trade::{dec_from_f64, is_definitive_no_fill};
 
     // Anvil/Hardhat dev key #0 — public knowledge, safe to embed. Used to exercise the ERC-7739
     // signing path end to end.
@@ -1369,6 +1406,41 @@ mod tests {
         .unwrap();
         assert_eq!(order.takerAmount, U256::from(12_340_000u64));
         assert_eq!(order.makerAmount, U256::from(3_825_400u64));
+    }
+
+    #[test]
+    fn snap_keeps_an_on_grid_price() {
+        assert_eq!(snap_to_tick(dec!(0.89), dec!(0.01)).unwrap(), dec!(0.89));
+        assert_eq!(snap_to_tick(dec!(0.888), dec!(0.001)).unwrap(), dec!(0.888));
+    }
+
+    #[test]
+    fn snap_strips_float_dust() {
+        let dusty = dec_from_f64(0.1 + 0.2).unwrap();
+        assert_eq!(snap_to_tick(dusty, dec!(0.01)).unwrap(), dec!(0.3));
+    }
+
+    #[test]
+    fn snap_refuses_an_off_grid_price_as_not_sent() {
+        for price in [dec!(0.888), dec!(0.904)] {
+            let err = snap_to_tick(price, dec!(0.01)).expect_err("off the 0.01 grid");
+            assert!(is_definitive_no_fill(&err), "{price}: {err:#}");
+            assert!(err.is::<NotSent>(), "{price}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn market_buy_amount_has_at_most_two_decimals() {
+        // (size, price, ok): the amount is size x price.
+        for (size, price, ok) in [
+            (dec!(7.5), dec!(0.888), true),   // 6.66
+            (dec!(7.5), dec!(0.89), false),   // 6.675
+            (dec!(16.25), dec!(0.13), false), // 2.1125
+            (dec!(20), dec!(0.96), true),     // 19.2
+            (dec!(17.5), dec!(0.62), true),   // 10.85
+        ] {
+            assert_eq!(market_buy_amount_ok(size, price), ok, "{size} @ {price}");
+        }
     }
 
     /// The ERC-7739 wrapper embeds this exact string in the type hash and signature suffix, and

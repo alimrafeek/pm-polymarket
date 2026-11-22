@@ -836,9 +836,51 @@ async fn handle_event(
             result
         }
         Some("price_change") => apply_price_change(event, books, recv_us).await,
-        // tick_size_change / last_trade_price / etc. are not needed for book maintenance.
+        Some("tick_size_change") => apply_tick_size_change(event, books).await,
+        // last_trade_price / etc. are not needed for book maintenance.
         _ => Ok(()),
     }
+}
+
+/// The tick sizes Polymarket uses. A `new_tick_size` outside this set is not written.
+const KNOWN_TICKS: [f64; 4] = [0.1, 0.01, 0.001, 0.0001];
+
+/// A market's tick changed (it does so when the price crosses 0.96 or 0.04). Write the new value
+/// and wake the market so the daemon's publish round sends `TickSize`.
+///
+/// Metadata, not a quote: the stamp, the bids and the asks are left alone. `old_tick_size` is not
+/// read. YES and NO share one tick `Arc` in the daemon, so a write through this token reaches both.
+async fn apply_tick_size_change(event: &Value, books: &PolyBooks) -> Result<()> {
+    let Some(asset_id) = event["asset_id"].as_str() else {
+        return Ok(());
+    };
+    let Some(token) = books.routed(asset_id) else {
+        return Ok(());
+    };
+
+    let raw = &event["new_tick_size"];
+    let new = as_f64_lenient(raw);
+    if !KNOWN_TICKS.iter().any(|t| (t - new).abs() < 1e-12) {
+        eprintln!("[poly-ws] tick_size_change for {}: unusable new_tick_size {raw}", token.label);
+        return Ok(());
+    }
+
+    let old = {
+        let mut guard = token.tick_size.lock().await;
+        let old = *guard;
+        if (old - new).abs() < 1e-12 {
+            return Ok(());
+        }
+        *guard = new;
+        old
+    };
+    println!(
+        "[{}] : [poly-ws] tick_size_change {}: {old} -> {new}",
+        get_timestamp_ist(),
+        token.label
+    );
+    token.notify();
+    Ok(())
 }
 
 /// The venue's own timestamp on a market-channel event: `timestamp`, epoch milliseconds, sent as
@@ -1366,5 +1408,125 @@ mod tests {
             "sorted by label, nothing elided"
         );
         assert_eq!(describe_assets(&all, &books, 2), "Market a; Market b; +1 more");
+    }
+
+    /// Token "a" (tick 0.01, a stamp already set) and the notifier of the one market reading it.
+    fn books_with_a_stamped_token() -> (PolyBooks, Arc<Notify>) {
+        let notify = Arc::new(Notify::new());
+        let mut book = book_with_levels("Market / YES");
+        book.change = vec![notify.clone()];
+        book.stamp.set(FeedStamp { venue_ms: 7, recv_us: 9 });
+        (Registry::from_map_active(HashMap::from([("a".to_string(), book)])), notify)
+    }
+
+    fn tick_size_change_frame(new_tick_size: Value) -> Value {
+        json!({
+            "event_type": "tick_size_change",
+            "asset_id": "a",
+            "market": "0xcondition",
+            "old_tick_size": "0.01",
+            "new_tick_size": new_tick_size,
+            "timestamp": "1795372000000",
+        })
+    }
+
+    async fn woke(notify: &Notify) -> bool {
+        tokio::time::timeout(Duration::from_millis(100), notify.notified()).await.is_ok()
+    }
+
+    /// Everything a tick change must leave alone: the quote and the stamp.
+    async fn assert_quote_untouched(books: &PolyBooks) {
+        let token = books.unit("a").unwrap();
+        let bids = token.bids.lock().await.clone();
+        let asks = token.asks.lock().await.clone();
+        assert_eq!((bids.len(), bids[0].price, bids[0].size), (1, 0.40, 100.0));
+        assert_eq!((asks.len(), asks[0].price, asks[0].size), (1, 0.60, 100.0));
+        assert_eq!(token.stamp.get(), FeedStamp { venue_ms: 7, recv_us: 9 });
+    }
+
+    #[tokio::test]
+    async fn tick_size_change_writes_the_new_tick_and_wakes_the_market() {
+        let (books, notify) = books_with_a_stamped_token();
+        assert_eq!(*books.unit("a").unwrap().tick_size.lock().await, 0.01);
+
+        handle_event(
+            &tick_size_change_frame(json!("0.001")),
+            &books,
+            &Mutex::new(HashSet::new()),
+            42,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*books.unit("a").unwrap().tick_size.lock().await, 0.001);
+        assert!(woke(&notify).await, "the market was woken");
+        assert_quote_untouched(&books).await;
+    }
+
+    #[tokio::test]
+    async fn tick_size_change_accepts_a_numeric_value() {
+        let (books, notify) = books_with_a_stamped_token();
+
+        apply_tick_size_change(&tick_size_change_frame(json!(0.001)), &books).await.unwrap();
+
+        assert_eq!(*books.unit("a").unwrap().tick_size.lock().await, 0.001);
+        assert!(woke(&notify).await, "the market was woken");
+        assert_quote_untouched(&books).await;
+    }
+
+    #[tokio::test]
+    async fn tick_size_change_in_an_array_frame_is_applied() {
+        let (books, notify) = books_with_a_stamped_token();
+        let frame = json!([tick_size_change_frame(json!("0.001"))]).to_string();
+
+        handle_message(&frame, &books, &Mutex::new(HashSet::new()), 42).await.unwrap();
+
+        assert_eq!(*books.unit("a").unwrap().tick_size.lock().await, 0.001);
+        assert!(woke(&notify).await, "the market was woken");
+        assert_quote_untouched(&books).await;
+    }
+
+    #[tokio::test]
+    async fn tick_size_change_for_an_unrouted_token_is_ignored() {
+        let (books, notify) = books_with_a_stamped_token();
+        let mut frame = tick_size_change_frame(json!("0.001"));
+        frame["asset_id"] = json!("not-routed");
+
+        apply_tick_size_change(&frame, &books).await.unwrap();
+
+        assert_eq!(*books.unit("a").unwrap().tick_size.lock().await, 0.01);
+        assert!(!woke(&notify).await, "nothing was woken");
+        assert_quote_untouched(&books).await;
+    }
+
+    #[tokio::test]
+    async fn tick_size_change_with_an_unusable_value_is_ignored() {
+        for bad in [Some(json!("0.005")), Some(json!("abc")), None] {
+            let (books, notify) = books_with_a_stamped_token();
+            let mut frame = tick_size_change_frame(json!(null));
+            match bad {
+                Some(v) => frame["new_tick_size"] = v,
+                None => {
+                    frame.as_object_mut().unwrap().remove("new_tick_size");
+                }
+            }
+
+            apply_tick_size_change(&frame, &books).await.unwrap();
+
+            assert_eq!(*books.unit("a").unwrap().tick_size.lock().await, 0.01, "{frame}");
+            assert!(!woke(&notify).await, "nothing was woken for {frame}");
+            assert_quote_untouched(&books).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_size_change_to_the_same_value_does_not_wake() {
+        let (books, notify) = books_with_a_stamped_token();
+
+        apply_tick_size_change(&tick_size_change_frame(json!("0.01")), &books).await.unwrap();
+
+        assert_eq!(*books.unit("a").unwrap().tick_size.lock().await, 0.01);
+        assert!(!woke(&notify).await, "nothing was woken");
+        assert_quote_untouched(&books).await;
     }
 }
