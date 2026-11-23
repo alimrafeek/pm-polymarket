@@ -566,6 +566,65 @@ fn announce(conn: &str, event: &str) {
     log_event(PRUNE_LOG, &format!("[poly-ws#{conn}] {event}"));
 }
 
+/// VENUE_HALT: a `market_resolved` event: the market's tokens, and the winner when given.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolyResolved {
+    /// `assets_ids`: every token id of the market.
+    pub assets: Vec<String>,
+    /// `winning_asset_id`, when present and not empty. Logged only.
+    pub winning_asset: Option<String>,
+}
+
+/// VENUE_HALT: where `market_resolved` events go. Set once, by the daemon, before its first
+/// connection. While it is unset (the single-process binary, every test) the subscribe frame and
+/// the event handling are exactly as before.
+static RESOLVED_SINK: std::sync::OnceLock<mpsc::UnboundedSender<PolyResolved>> =
+    std::sync::OnceLock::new();
+
+/// Whether the first `market_resolved` of this process has been logged.
+static FIRST_RESOLVED_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the sink. `false` when it was already set (the first one stays).
+pub fn enable_resolved_events(tx: mpsc::UnboundedSender<PolyResolved>) -> bool {
+    RESOLVED_SINK.set(tx).is_ok()
+}
+
+/// The market-channel subscribe frame. `custom` adds `"custom_feature_enabled": true`, which turns
+/// on `market_resolved` (and `best_bid_ask` and `new_market`, which this crate ignores). Without it
+/// the string is byte for byte what `connect_and_run` sent before VENUE_HALT. Pure.
+fn subscribe_frame(asset_ids: &[String], custom: bool) -> String {
+    let mut frame = json!({
+        "assets_ids": asset_ids,
+        "type": "market",
+    });
+    if custom {
+        frame["custom_feature_enabled"] = json!(true);
+    }
+    frame.to_string()
+}
+
+/// VENUE_HALT: `Some` for a `market_resolved` event with at least one token id. `assets_ids` is an
+/// array of strings, or a string holding such an array (Gamma writes token lists that way); empty
+/// strings are dropped. Pure.
+pub fn parse_market_resolved(event: &Value) -> Option<PolyResolved> {
+    if event["event_type"].as_str() != Some("market_resolved") {
+        return None;
+    }
+    let listed: Vec<String> = match &event["assets_ids"] {
+        Value::Array(items) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        Value::String(s) => serde_json::from_str::<Vec<String>>(s).ok()?,
+        _ => return None,
+    };
+    let assets: Vec<String> = listed.into_iter().filter(|id| !id.is_empty()).collect();
+    if assets.is_empty() {
+        return None;
+    }
+    let winning_asset =
+        event["winning_asset_id"].as_str().filter(|id| !id.is_empty()).map(str::to_string);
+    Some(PolyResolved { assets, winning_asset })
+}
+
 async fn connect_and_run(
     conn: &str,
     asset_ids: &[String],
@@ -595,11 +654,7 @@ async fn connect_and_run(
     let (write, mut read) = ws_stream.split();
     let write = Arc::new(Mutex::new(write));
 
-    let subscribe_msg = json!({
-        "assets_ids": asset_ids,
-        "type": "market",
-    })
-    .to_string();
+    let subscribe_msg = subscribe_frame(asset_ids, RESOLVED_SINK.get().is_some());
     write.lock().await.send(Message::Text(subscribe_msg)).await?;
 
     // Watchdog state, updated by the read loop as frames arrive:
@@ -837,7 +892,23 @@ async fn handle_event(
         }
         Some("price_change") => apply_price_change(event, books, recv_us).await,
         Some("tick_size_change") => apply_tick_size_change(event, books).await,
-        // last_trade_price / etc. are not needed for book maintenance.
+        // VENUE_HALT: handed on to the daemon when it set a sink; nothing else changes. No book, no
+        // tick and no pending entry is touched here.
+        Some("market_resolved") => {
+            if let Some(tx) = RESOLVED_SINK.get() {
+                if !FIRST_RESOLVED_LOGGED.swap(true, Ordering::Relaxed) {
+                    println!(
+                        "[{}] : [poly-ws] first market_resolved: {event}",
+                        get_timestamp_ist()
+                    );
+                }
+                if let Some(resolved) = parse_market_resolved(event) {
+                    let _ = tx.send(resolved);
+                }
+            }
+            Ok(())
+        }
+        // last_trade_price / best_bid_ask / new_market / etc. are not needed for book maintenance.
         _ => Ok(()),
     }
 }
@@ -1537,5 +1608,135 @@ mod tests {
         assert_eq!(*books.unit("a").unwrap().tick_size.lock().await, 0.01);
         assert!(!woke(&notify).await, "nothing was woken");
         assert_quote_untouched(&books).await;
+    }
+
+    #[test]
+    fn vht3_the_subscribe_frame_is_todays_string_unless_the_custom_flag_is_asked_for() {
+        let ids = ids(&["a", "b"]);
+
+        // Byte for byte what `connect_and_run` sent at HEAD.
+        assert_eq!(
+            subscribe_frame(&ids, false),
+            json!({ "assets_ids": ids, "type": "market" }).to_string()
+        );
+        assert!(!subscribe_frame(&ids, false).contains("custom_feature_enabled"));
+
+        let custom: Value = serde_json::from_str(&subscribe_frame(&ids, true)).unwrap();
+        assert_eq!(
+            custom,
+            json!({ "assets_ids": ids, "type": "market", "custom_feature_enabled": true })
+        );
+    }
+
+    /// The doc's `market_resolved` payload.
+    fn market_resolved_frame() -> Value {
+        json!({
+            "event_type": "market_resolved",
+            "id": "1031769",
+            "market": "0xcondition",
+            "assets_ids": ["tok-yes", "tok-no"],
+            "winning_asset_id": "tok-yes",
+            "winning_outcome": "Yes",
+            "timestamp": "1795372000000",
+        })
+    }
+
+    #[test]
+    fn vht4_parse_market_resolved_reads_the_tokens_and_the_winner() {
+        let both = Some(PolyResolved {
+            assets: ids(&["tok-yes", "tok-no"]),
+            winning_asset: Some("tok-yes".to_string()),
+        });
+        assert_eq!(parse_market_resolved(&market_resolved_frame()), both);
+
+        // Gamma writes a token list as a string holding a JSON array.
+        let mut as_string = market_resolved_frame();
+        as_string["assets_ids"] = json!(r#"["tok-yes","tok-no"]"#);
+        assert_eq!(parse_market_resolved(&as_string), both);
+
+        let mut no_winner = market_resolved_frame();
+        no_winner.as_object_mut().unwrap().remove("winning_asset_id");
+        assert_eq!(
+            parse_market_resolved(&no_winner),
+            Some(PolyResolved { assets: ids(&["tok-yes", "tok-no"]), winning_asset: None })
+        );
+
+        let with_type = |event_type: &str| {
+            let mut frame = market_resolved_frame();
+            frame["event_type"] = json!(event_type);
+            frame
+        };
+        let with_assets = |assets: Value| {
+            let mut frame = market_resolved_frame();
+            frame["assets_ids"] = assets;
+            frame
+        };
+        let mut no_assets = market_resolved_frame();
+        no_assets.as_object_mut().unwrap().remove("assets_ids");
+
+        for (name, frame) in [
+            ("best_bid_ask", with_type("best_bid_ask")),
+            ("new_market", with_type("new_market")),
+            ("book", with_type("book")),
+            ("no assets_ids", no_assets),
+            ("empty array", with_assets(json!([]))),
+            ("one empty string", with_assets(json!([""]))),
+        ] {
+            assert_eq!(parse_market_resolved(&frame), None, "{name}");
+        }
+    }
+
+    /// Every book, tick and stamp of the two tokens, plus the pending set, as plain values.
+    async fn book_state(
+        books: &PolyBooks,
+        pending: &Mutex<HashSet<String>>,
+    ) -> (Vec<(String, Vec<(f64, f64)>, Vec<(f64, f64)>, f64, FeedStamp)>, Vec<String>) {
+        let mut tokens = Vec::new();
+        for id in ["a", "b"] {
+            let token = books.unit(id).unwrap();
+            let levels = |v: &Vec<OrderBookLevel>| v.iter().map(|l| (l.price, l.size)).collect();
+            let bids = levels(&*token.bids.lock().await);
+            let asks = levels(&*token.asks.lock().await);
+            let tick = *token.tick_size.lock().await;
+            tokens.push((id.to_string(), bids, asks, tick, token.stamp.get()));
+        }
+        let mut pending: Vec<String> = pending.lock().await.iter().cloned().collect();
+        pending.sort();
+        (tokens, pending)
+    }
+
+    #[tokio::test]
+    async fn vht5_best_bid_ask_new_market_and_market_resolved_change_nothing() {
+        let books = live_books([("a", "Market / YES"), ("b", "Market / NO")]);
+        books.unit("a").unwrap().stamp.set(FeedStamp { venue_ms: 7, recv_us: 9 });
+        let pending = Mutex::new(HashSet::from(["a".to_string(), "b".to_string()]));
+        let before = book_state(&books, &pending).await;
+
+        let new_market = json!({
+            "event_type": "new_market", "id": "1031769", "market": "0xcondition",
+            "assets_ids": ["a", "b"], "outcomes": ["Yes", "No"], "timestamp": "1795372000000",
+        });
+        let mut resolved_ours = market_resolved_frame();
+        resolved_ours["assets_ids"] = json!(["a", "b"]);
+        resolved_ours["winning_asset_id"] = json!("a");
+
+        for frame in [best_bid_ask_frame(), new_market, resolved_ours, market_resolved_frame()] {
+            // Alone, then in an array.
+            for text in [frame.to_string(), json!([frame]).to_string()] {
+                handle_message(&text, &books, &pending, 42).await.unwrap();
+                assert_eq!(book_state(&books, &pending).await, before, "{text}");
+            }
+        }
+        // All three kinds together in one array frame.
+        let mixed = json!([best_bid_ask_frame(), market_resolved_frame()]).to_string();
+        handle_message(&mixed, &books, &pending, 42).await.unwrap();
+        assert_eq!(book_state(&books, &pending).await, before, "{mixed}");
+    }
+
+    fn best_bid_ask_frame() -> Value {
+        json!({
+            "event_type": "best_bid_ask", "market": "0xcondition", "asset_id": "a",
+            "best_bid": "0.73", "best_ask": "0.77", "spread": "0.04", "timestamp": "1795372000000",
+        })
     }
 }
