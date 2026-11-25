@@ -250,8 +250,12 @@ const POSITIONS_PASSES: [Option<&str>; 1] = [None];
 /// Walked by cursor until `next_cursor` is `null`, because a truncated read is not a visibly
 /// degraded one: `seed_positions` treats a token it never saw as flat, and a leg that looks flat
 /// is handed a full `MAX_PAIRS_PER_TRADE` of fresh capacity on top of inventory it already holds
-/// — and its real holdings are never offered for exit. Positions below `filter_amount` (1 share)
-/// are still dropped by the venue, which is dust against a 40-pair cap.
+/// — and its real holdings are never offered for exit.
+///
+/// Holdings under 0.01 share are left out by the venue (`filter_amount=0.01`). The filter must
+/// stay at or below the reconcile's 0.01 tolerance: `reconcile_positions` reads a missing token as
+/// 0 shares and cuts the ledger to it, so a higher filter erases real holdings from the ledger
+/// (POLY_DUST, 2026-11-25).
 pub async fn get_poly_positions(
     trader: &crate::trade::PolyTrader,
 ) -> Result<Vec<(String, f64, f64)>> {
@@ -373,7 +377,7 @@ where
 /// cursor is opaque and signed and may hold `+`, `/` or `=`, so it is percent-encoded.
 fn positions_path(status: Option<&str>, cursor: Option<&str>) -> String {
     let mut path = format!(
-        "/positions?filter_type=TOKENS&filter_amount=1&sort_by=TOKENS&sort_direction=DESC&limit={POSITIONS_PAGE_LIMIT}"
+        "/positions?filter_type=TOKENS&filter_amount=0.01&sort_by=TOKENS&sort_direction=DESC&limit={POSITIONS_PAGE_LIMIT}"
     );
     if let Some(status) = status {
         path.push_str("&status=");
@@ -1190,7 +1194,7 @@ mod tests {
         let first = positions_path(None, None);
         assert_eq!(
             first,
-            "/positions?filter_type=TOKENS&filter_amount=1&sort_by=TOKENS&sort_direction=DESC&limit=1000"
+            "/positions?filter_type=TOKENS&filter_amount=0.01&sort_by=TOKENS&sort_direction=DESC&limit=1000"
         );
         assert_eq!(
             positions_path(None, Some("a+b/c=")),
@@ -1275,6 +1279,39 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("truncated"), "{err}");
         assert_eq!(fetched, POSITIONS_MAX_PAGES);
+    }
+
+    /// PD-T1. The old 1-share filter hid every holding under 1 share, and the start-up reconcile
+    /// cut those real holdings from the ledger. Every page of every pass asks down to 0.01 share.
+    #[test]
+    fn positions_path_never_drops_holdings_over_a_hundredth() {
+        // Built in two parts so that a grep for the old filter finds only production code.
+        let one_share = ["filter_amount=", "1"].concat();
+        for status in POSITIONS_PASSES {
+            for path in [positions_path(status, None), positions_path(status, Some("abc"))] {
+                assert!(path.contains("filter_amount=0.01"), "{path}");
+                assert!(!path.contains(&one_share), "{path}");
+            }
+        }
+    }
+
+    /// PD-T2. No code on our side drops a small row: 20, 0.99 and 0.01 shares all come back, in
+    /// the order the venue gave them.
+    #[tokio::test]
+    async fn the_walk_keeps_holdings_under_one_share() {
+        let (result, _) = walk(vec![page(
+            json!([
+                {"token_id":"1","current_size":20.0},
+                {"token_id":"2","current_size":0.99},
+                {"token_id":"3","current_size":0.01}
+            ]),
+            None,
+        )])
+        .await;
+        let rows = result.unwrap();
+        assert_eq!(token_ids(&rows), ["1", "2", "3"]);
+        let sizes: Vec<f64> = rows.iter().map(|r| r["current_size"].as_f64().unwrap()).collect();
+        assert_eq!(sizes, [20.0, 0.99, 0.01]);
     }
 
     /// A market object shaped like the live world-cup-winner capture (2026-07-18, feeType
